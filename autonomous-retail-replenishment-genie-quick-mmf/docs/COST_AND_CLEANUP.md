@@ -15,10 +15,11 @@ cost is near zero — you pay mainly while forecasting and while the flow runs.
 |---|---|---|
 | API Gateway (HTTP API) | per request | < $0.01 — a handful of order/ticket calls per run |
 | AWS Lambda | per request + GB-s | effectively $0 (well within free tier; 256 MB, <1s) |
-| DynamoDB (2 tables, on-demand) | per request + storage | < $0.01 — tens of small items |
+| DynamoDB (2 tables, on-demand, PITR on) | per request + storage | < $0.01 — tens of small items |
 | Secrets Manager (1 secret) | $0.40 / secret / month + API calls | ~$0.40 / month |
+| KMS (1 customer-managed key) | $1.00 / key / month + per-request | ~$1.00 / month |
 | Amazon S3 Tables (Iceberg) | storage + requests + compaction | cents — 63,861 small rows |
-| **AWS subtotal** | | **~$0.50 / month at rest**, plus negligible per-run |
+| **AWS subtotal** | | **~$1.50 / month at rest**, plus negligible per-run |
 
 **Databricks side:**
 | Component | Pricing model | Notes |
@@ -30,9 +31,10 @@ cost is near zero — you pay mainly while forecasting and while the flow runs.
 **Amazon Quick:** per-user subscription (Author/Author Pro). Flows, connectors, and schedules
 are included in the subscription — no separate per-run charge.
 
-**Bottom line:** at rest the demo costs roughly the price of one Secrets Manager secret (~$0.40/mo)
-plus Databricks/S3 storage; the meaningful spend is the SQL warehouse while Genie answers questions
-and the GPU while you (re)generate forecasts. Both are serverless and scale to zero when idle.
+**Bottom line:** at rest the demo costs roughly a Secrets Manager secret (~$0.40/mo) plus one
+customer-managed KMS key (~$1.00/mo), plus Databricks/S3 storage; the meaningful spend is the SQL
+warehouse while Genie answers questions and the GPU while you (re)generate forecasts. Both are
+serverless and scale to zero when idle.
 
 > Tip: the Databricks Serverless SQL Warehouse auto-stop and the per-second GPU billing are what
 > keep this cheap. Don't run forecasting on an always-on cluster for a demo.
@@ -49,7 +51,9 @@ aws cloudformation delete-stack --stack-name supplier-order-api --region <REGION
 aws cloudformation wait stack-delete-complete --stack-name supplier-order-api --region <REGION>
 ```
 This removes the API Gateway, Lambda, both DynamoDB tables, the IAM role, and the Secrets Manager
-secret. (If deletion protection or a retain policy is ever added, disable it first — none is set here.)
+secret. The customer-managed KMS key is **scheduled for deletion** (7–30 day pending window, per AWS
+policy — a key cannot be deleted instantly); no further charge accrues once it is pending deletion.
+(If deletion protection or a retain policy is ever added, disable it first — none is set here.)
 
 **2. Remove the S3 Tables supplier data:**
 ```bash

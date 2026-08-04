@@ -9,16 +9,43 @@ Parameters:
   ApiKeyValue:
     Type: String
     NoEcho: true
-    Default: demo-supplier-key-change-me
-    Description: Shared API key the caller (Amazon Quick) must send in the x-api-key header.
+    MinLength: 20
+    AllowedPattern: '[A-Za-z0-9._~-]+'
+    Description: >-
+      Shared API key the caller (Amazon Quick) must send in the x-api-key header. REQUIRED,
+      no default: supply a strong, randomly generated value at deploy time (for example
+      `openssl rand -hex 24`). Do not reuse a well-known or example value.
 
 Resources:
+
+  # Customer-managed KMS key encrypting the API-key secret and both DynamoDB tables at rest.
+  DataKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for the Supplier Order API (Secrets Manager secret + DynamoDB tables).
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountIAMPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/supplier-order-api
+      TargetKeyId: !Ref DataKey
 
   ApiKeySecret:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: supplier-order-api/api-key
       Description: API key the caller (Amazon Quick) sends in the x-api-key header to the Supplier Order API.
+      KmsKeyId: !Ref DataKey
       SecretString: !Sub '{"api_key":"${ApiKeyValue}"}'
 
   OrdersTable:
@@ -32,6 +59,12 @@ Resources:
       KeySchema:
         - AttributeName: order_id
           KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
 
   TicketsTable:
     Type: AWS::DynamoDB::Table
@@ -44,6 +77,12 @@ Resources:
       KeySchema:
         - AttributeName: ticket_id
           KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
 
   OrderFnRole:
     Type: AWS::IAM::Role
@@ -71,6 +110,9 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref ApiKeySecret
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !GetAtt DataKey.Arn
 
   OrderFn:
     Type: AWS::Lambda::Function

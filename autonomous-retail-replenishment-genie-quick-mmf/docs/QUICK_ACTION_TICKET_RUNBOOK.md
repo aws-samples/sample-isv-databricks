@@ -33,8 +33,12 @@ Notes:
   You can deploy only **one** copy per account+region. If you delete and redeploy within 7 days, the
   Secrets Manager secret name is still in its recovery window — either wait, or
   `aws secretsmanager delete-secret --secret-id supplier-order-api/api-key --force-delete-without-recovery`.
-- `ApiKeyValue` defaults to `demo-supplier-key-change-me` if you omit it; the Lambda's `x-api-key`
-  check is optional for the demo, so auth "None" works in Quick. Override it (as above) for anything real.
+- `ApiKeyValue` is **required** (no default) — the deploy command above generates a strong random
+  value with `openssl rand -hex 24`. The Lambda's `x-api-key` check is optional for the demo, so
+  auth "None" works in Quick; the key is still stored (KMS-encrypted) in Secrets Manager.
+- The stack also creates a customer-managed **KMS key** (`alias/supplier-order-api`) that encrypts the
+  Secrets Manager secret and both DynamoDB tables at rest; the tables have point-in-time recovery
+  enabled. Deleting the stack schedules the key for deletion (7–30 day pending window).
 
 ## Deployed resources (<REGION>)
 - Supplier Order API base URL: `https://<API_ID>.execute-api.<REGION>.amazonaws.com/prod`
