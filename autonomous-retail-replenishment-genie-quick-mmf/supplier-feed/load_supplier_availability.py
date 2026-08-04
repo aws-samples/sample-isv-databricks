@@ -47,6 +47,9 @@ WAREHOUSE_ARN = f"arn:aws:s3tables:{REGION}:{ACCOUNT}:bucket/{BUCKET}"
 
 FORECAST_DATES = [dt.date(2024, 6, 26) + dt.timedelta(days=i) for i in range(7)]
 HF_REPO = "Dingdong-Inc/FreshRetailNet-50K"
+# Pin to an immutable dataset revision (commit SHA) for reproducible, tamper-evident downloads.
+# Override with HF_REVISION=<sha|tag> if you need a different snapshot.
+HF_REVISION = os.environ.get("HF_REVISION", "08c1fab7f9257bc73679d415d65d644165d351d4")
 
 # Geographic labels carried on the supplier feed (a real supplier feed names the city/region it serves).
 # Keyed by city_id; MUST match the retailer-side location_dim mapping so both sides share the same
@@ -91,13 +94,14 @@ def get_retailer_product_city_keys() -> list[tuple[int, int]]:
     """Distinct (retailer product_id, city_id) pairs from the HF FreshRetailNet parquet."""
     from huggingface_hub import HfApi, hf_hub_download
     api = HfApi()
-    files = [f for f in api.list_repo_files(HF_REPO, repo_type="dataset") if f.endswith(".parquet")]
+    files = [f for f in api.list_repo_files(HF_REPO, repo_type="dataset", revision=HF_REVISION) if f.endswith(".parquet")]
     if not files:
         raise SystemExit(f"No parquet files in HF dataset {HF_REPO}")
     print(f"HF parquet files: {len(files)} (reading product/city keys)", flush=True)
     pairs: set[tuple[int, int]] = set()
     for fp in files:
-        local = hf_hub_download(HF_REPO, fp, repo_type="dataset")
+        # nosec B615 - revision is pinned: HF_REVISION defaults to an immutable commit SHA (env-overridable).
+        local = hf_hub_download(HF_REPO, fp, repo_type="dataset", revision=HF_REVISION)  # nosec B615
         t = pq.read_table(local, columns=["product_id", "city_id"])
         for pid, city in zip(t.column("product_id").to_pylist(), t.column("city_id").to_pylist()):
             pairs.add((int(pid), int(city)))

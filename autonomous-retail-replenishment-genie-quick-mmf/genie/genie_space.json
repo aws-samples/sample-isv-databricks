@@ -299,7 +299,7 @@
   "instructions": {
     "text_instructions": [
       {
-        "id": "01f16748021a1d1e940ff8f6b313dca4",
+        "id": "",
         "content": [
           "You are a supply chain demand forecasting assistant over the FreshRetailNet dataset.\n",
           "  All forecasts come from the Amazon Chronos-2 foundation model.\n",
@@ -360,7 +360,7 @@
     ],
     "example_question_sqls": [
       {
-        "id": "01f168427e521108ad377c4e78e3f676",
+        "id": "",
         "question": [
           "Which SKUs have a demand surge?"
         ],
