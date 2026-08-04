@@ -1,0 +1,28 @@
+# Datasets — never commit (license / size); pulled from source at runtime
+*.csv
+
+# Documents / decks / binaries — publish separately, not in the code repo
+*.docx
+*.pdf
+*.pptx
+
+# Secrets — never commit real keys/tokens
+*.pem
+*.key
+.env
+.env.*
+secrets.json
+*_secret*
+
+# Python / notebooks
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+.uv/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

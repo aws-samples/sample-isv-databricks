@@ -1,0 +1,247 @@
+{
+  "openapi": "3.0.1",
+  "info": {
+    "title": "Supplier Order API",
+    "description": "External supplier order-intake API. Submit a single purchase order to the supplier, or raise a ticket for human review. Routine orders auto-submit; exception cases become tickets. Flows variant \u2014 single-record operations only (no array/bulk endpoint, which Quick OpenAPI does not support).",
+    "version": "1.0"
+  },
+  "servers": [
+    {
+      "url": "https://<API_ID>.execute-api.<REGION>.amazonaws.com/prod"
+    }
+  ],
+  "paths": {
+    "/orders": {
+      "post": {
+        "operationId": "submitOrder",
+        "summary": "Submit a single purchase order to the supplier.",
+        "description": "Submit one routine purchase order to the chosen supplier for a single SKU. Use when a single supplier can cover the forecasted demand within its lead time.",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Order"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Order submitted successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderConfirmation"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key"
+          }
+        }
+      }
+    },
+    "/tickets": {
+      "post": {
+        "operationId": "createTicket",
+        "summary": "Raise a ticket for manual review (exception / approval path).",
+        "description": "Raise one human-review ticket when no single supplier can cover the forecasted demand within its lead time. Use for the exception path.",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Ticket"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ticket created with status OPEN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketConfirmation"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key"
+      }
+    },
+    "schemas": {
+      "Order": {
+        "type": "object",
+        "required": [
+          "supplier_id",
+          "retailer_product_id",
+          "quantity"
+        ],
+        "properties": {
+          "supplier_id": {
+            "type": "string",
+            "description": "Chosen supplier id",
+            "example": "SUP_S2_00"
+          },
+          "supplier_product_id": {
+            "type": "string",
+            "description": "Supplier's own product code for this item"
+          },
+          "retailer_product_id": {
+            "type": "string",
+            "description": "Retailer product id used as the reconciliation key",
+            "example": "18_122"
+          },
+          "product_name": {
+            "type": "string",
+            "description": "Human-readable product name",
+            "example": "Skim Milk"
+          },
+          "city_id": {
+            "type": "string",
+            "description": "City id for the destination"
+          },
+          "region": {
+            "type": "string",
+            "description": "Region name for the destination",
+            "example": "Northeast"
+          },
+          "quantity": {
+            "type": "string",
+            "description": "Number of units to order"
+          },
+          "unit_cost": {
+            "type": "string",
+            "description": "Unit cost from the chosen supplier"
+          },
+          "order_type": {
+            "type": "string",
+            "enum": [
+              "routine",
+              "exception"
+            ],
+            "description": "routine auto-submits the order; exception routes it to approval"
+          }
+        }
+      },
+      "OrderConfirmation": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string",
+            "description": "Generated order id",
+            "example": "ORD-XXXXXXXXXXXX"
+          },
+          "status": {
+            "type": "string",
+            "description": "SUBMITTED for routine orders or PENDING_APPROVAL for exceptions"
+          },
+          "supplier_id": {
+            "type": "string",
+            "description": "Supplier the order was placed with"
+          },
+          "retailer_product_id": {
+            "type": "string",
+            "description": "Retailer product id that was ordered"
+          },
+          "quantity": {
+            "type": "string",
+            "description": "Number of units ordered"
+          }
+        }
+      },
+      "Ticket": {
+        "type": "object",
+        "required": [
+          "subject"
+        ],
+        "properties": {
+          "subject": {
+            "type": "string",
+            "description": "Short ticket title"
+          },
+          "description": {
+            "type": "string",
+            "description": "Longer description of why human review is needed"
+          },
+          "retailer_product_id": {
+            "type": "string",
+            "description": "Retailer product id the ticket concerns",
+            "example": "18_122"
+          },
+          "product_name": {
+            "type": "string",
+            "description": "Human-readable product name"
+          },
+          "region": {
+            "type": "string",
+            "description": "Region name",
+            "example": "Northeast"
+          },
+          "priority": {
+            "type": "string",
+            "enum": [
+              "Low",
+              "Medium",
+              "High"
+            ],
+            "description": "Ticket priority; use High for demand surges"
+          },
+          "category": {
+            "type": "string",
+            "description": "Ticket category",
+            "example": "supply-exception"
+          }
+        }
+      },
+      "TicketConfirmation": {
+        "type": "object",
+        "properties": {
+          "ticket_id": {
+            "type": "string",
+            "description": "Generated ticket id",
+            "example": "TKT-XXXXXXXXXXXX"
+          },
+          "status": {
+            "type": "string",
+            "description": "Ticket status",
+            "example": "OPEN"
+          },
+          "subject": {
+            "type": "string",
+            "description": "The ticket subject that was created"
+          },
+          "priority": {
+            "type": "string",
+            "description": "The priority assigned to the ticket"
+          }
+        }
+      }
+    }
+  }
+}

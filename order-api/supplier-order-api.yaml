@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Mock 3rd-party Supplier Order API (for the AWS x Databricks supply-chain automation demo).
+  Represents an EXTERNAL supplier's order-intake system that Amazon Quick calls to submit a
+  purchase order. Quick -> API Gateway (this) -> Lambda -> DynamoDB. The customer never owns
+  this; it stands in for the supplier's own API. Deploy/teardown as one stack.
+
+Parameters:
+  ApiKeyValue:
+    Type: String
+    NoEcho: true
+    Default: demo-supplier-key-change-me
+    Description: Shared API key the caller (Amazon Quick) must send in the x-api-key header.
+
+Resources:
+
+  ApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: supplier-order-api/api-key
+      Description: API key the caller (Amazon Quick) sends in the x-api-key header to the Supplier Order API.
+      SecretString: !Sub '{"api_key":"${ApiKeyValue}"}'
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: supplier-order-api-orders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: order_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: order_id
+          KeyType: HASH
+
+  TicketsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: supplier-order-api-tickets
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ticket_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ticket_id
+          KeyType: HASH
+
+  OrderFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: supplier-order-api-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: orders-ddb-and-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:Query, dynamodb:Scan]
+                Resource:
+                  - !GetAtt OrdersTable.Arn
+                  - !GetAtt TicketsTable.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref ApiKeySecret
+
+  OrderFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: supplier-order-api-handler
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt OrderFnRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          TICKETS_TABLE: !Ref TicketsTable
+          API_KEY_SECRET_ARN: !Ref ApiKeySecret
+      Code:
+        ZipFile: |
+          import json, os, time, uuid, decimal
+          import boto3
+          ddb = boto3.resource("dynamodb")
+          TABLE = ddb.Table(os.environ["ORDERS_TABLE"])
+          TICKETS = ddb.Table(os.environ["TICKETS_TABLE"])
+          _sm = boto3.client("secretsmanager")
+          _API_KEY = None
+
+          def _api_key():
+              # fetch + cache the key from Secrets Manager (not stored as a plaintext env var)
+              global _API_KEY
+              if _API_KEY is None:
+                  s = _sm.get_secret_value(SecretId=os.environ["API_KEY_SECRET_ARN"])
+                  _API_KEY = json.loads(s["SecretString"])["api_key"]
+              return _API_KEY
+
+          def _resp(code, body):
+              return {"statusCode": code, "headers": {"Content-Type": "application/json"},
+                      "body": json.dumps(body)}
+
+          def _save(o, order_type):
+              oid = "ORD-" + uuid.uuid4().hex[:12].upper()
+              item = {
+                  "order_id": oid,
+                  "supplier_id": str(o.get("supplier_id", "")),
+                  "supplier_product_id": str(o.get("supplier_product_id", "")),
+                  "retailer_product_id": str(o.get("retailer_product_id", "")),
+                  "product_name": str(o.get("product_name", "")),
+                  "city_id": str(o.get("city_id", "")),
+                  "region": str(o.get("region", "")),
+                  "quantity": str(o.get("quantity", "")),
+                  "unit_cost": str(o.get("unit_cost", "")),
+                  "order_type": order_type,          # routine (auto) | exception (approval)
+                  "status": "SUBMITTED" if order_type == "routine" else "PENDING_APPROVAL",
+                  "created_at": str(int(time.time())),
+              }
+              TABLE.put_item(Item=item)
+              return {"order_id": oid, "status": item["status"], "supplier_id": item["supplier_id"],
+                      "retailer_product_id": item["retailer_product_id"], "quantity": item["quantity"]}
+
+          def _save_ticket(t):
+              tid = "TKT-" + uuid.uuid4().hex[:12].upper()
+              item = {
+                  "ticket_id": tid,
+                  "subject": str(t.get("subject", "")),
+                  "description": str(t.get("description", "")),
+                  "retailer_product_id": str(t.get("retailer_product_id", "")),
+                  "product_name": str(t.get("product_name", "")),
+                  "region": str(t.get("region", "")),
+                  "priority": str(t.get("priority", "Medium")),
+                  "category": str(t.get("category", "supply-exception")),
+                  "status": "OPEN",
+                  "created_at": str(int(time.time())),
+              }
+              TICKETS.put_item(Item=item)
+              return {"ticket_id": tid, "status": item["status"], "subject": item["subject"],
+                      "priority": item["priority"]}
+
+          def handler(event, ctx):
+              # API-key check is OPTIONAL (demo): Amazon Quick Automate's REST connector uses OAuth or
+              # "none" and does not send a custom x-api-key by default. So we only ENFORCE the key if one
+              # is present (rejecting a wrong key), but allow no-key calls through. Production should
+              # front this with OAuth (e.g. Cognito client-credentials) instead of an optional key.
+              hdr = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+              sent = hdr.get("x-api-key")
+              if sent is not None and sent != _api_key():
+                  return _resp(401, {"error": "invalid x-api-key"})
+              raw = event.get("body") or "{}"
+              try:
+                  body = json.loads(raw)
+              except Exception:
+                  return _resp(400, {"error": "invalid JSON body"})
+              path = (event.get("rawPath") or event.get("requestContext", {})
+                      .get("http", {}).get("path") or "")
+              if path.endswith("/tickets"):
+                  if "subject" not in body:
+                      return _resp(400, {"error": "ticket requires 'subject'"})
+                  return _resp(200, _save_ticket(body))
+              if path.endswith("/orders/bulk"):
+                  orders = body.get("orders", [])
+                  if not isinstance(orders, list) or not orders:
+                      return _resp(400, {"error": "bulk requires non-empty 'orders' array"})
+                  conf = [_save(o, o.get("order_type", "routine")) for o in orders]
+                  return _resp(200, {"submitted": len(conf), "orders": conf})
+              # single order
+              if "supplier_id" not in body:
+                  return _resp(400, {"error": "order requires 'supplier_id'"})
+              return _resp(200, _save(body, body.get("order_type", "routine")))
+
+  OrderFnPerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${OrderApi}/*
+
+  OrderApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: supplier-order-api
+      ProtocolType: HTTP
+      Description: External supplier order-intake endpoint (mock 3rd-party system)
+
+  OrderIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref OrderApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt OrderFn.Arn
+      PayloadFormatVersion: '2.0'
+
+  RouteSingle:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref OrderApi
+      RouteKey: 'POST /orders'
+      Target: !Sub integrations/${OrderIntegration}
+
+  RouteBulk:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref OrderApi
+      RouteKey: 'POST /orders/bulk'
+      Target: !Sub integrations/${OrderIntegration}
+
+  RouteTickets:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref OrderApi
+      RouteKey: 'POST /tickets'
+      Target: !Sub integrations/${OrderIntegration}
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref OrderApi
+      StageName: prod
+      AutoDeploy: true
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL of the supplier order API
+    Value: !Sub https://${OrderApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+  SingleOrderEndpoint:
+    Value: !Sub https://${OrderApi}.execute-api.${AWS::Region}.amazonaws.com/prod/orders
+  BulkOrderEndpoint:
+    Value: !Sub https://${OrderApi}.execute-api.${AWS::Region}.amazonaws.com/prod/orders/bulk
+  TicketEndpoint:
+    Description: Create-ticket endpoint (exception / human-review path)
+    Value: !Sub https://${OrderApi}.execute-api.${AWS::Region}.amazonaws.com/prod/tickets
+  OrdersTableName:
+    Value: !Ref OrdersTable
+  TicketsTableName:
+    Value: !Ref TicketsTable
+  ApiKeySecretArn:
+    Description: Secrets Manager secret holding the API key (key 'api_key'). Retrieve with get-secret-value.
+    Value: !Ref ApiKeySecret

@@ -1,0 +1,164 @@
+{
+  "Name": "Supply Chain Replenishment Flow",
+  "Description": "Automated supply chain replenishment: detects demand surges, evaluates suppliers, places orders or raises tickets",
+  "FlowDefinition": {
+    "Steps": [
+      {
+        "StepId": "70ee29c4-042a-4e7b-97b1-ec58c3a15964",
+        "StepType": "CONNECTOR_ACTIONS",
+        "StepTitle": "Detect Demand Surges",
+        "StepConfig": {
+          "ConnectorActionsConfig": {
+            "prompt": "Return one row per surging SKU with EXACTLY these columns, computing the two matching keys directly in SQL (do not leave any id to be parsed later):\n\u00a0 - unique_id\n\u00a0 - retailer_product_id\u00a0 =\u00a0 CAST(split_part(unique_id, '_', 2) AS INT)\n\u00a0 - city_id\u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 =\u00a0 the demand_train city_id (join location_dim on city_id)\n\u00a0 - region\n\u00a0 - city_name\n\u00a0 - forecast_7d_total\n\u00a0 - surge_ratio\n\u00a0 A surge is where the average forecast over 2024-06-26 to 2024-07-02 is at least\n\u00a0 1.5x the average actual sales over the prior 14 days (2024-06-12 to 2024-06-25). Only include SKUs whose average actual sales over that prior 14-day window is at least 1 (avg_actual >= 1); exclude any SKU with average actual sales below 1. Return ONLY the structured result rows (one row per surging SKU) as data. Do not include any prose, explanation, commentary, headings, key observations, or a description of the SQL. Output only the rows so they can be iterated programmatically.",
+            "actionConnectorId": "<GENIE_MCP_CONNECTOR_ID>",
+            "actionConnectorType": "MODEL_CONTEXT_PROTOCOL",
+            "actionId": "ALL"
+          }
+        }
+      },
+      {
+        "StepId": "25491945-c2fa-4f2c-a8fe-415a638b105c",
+        "StepType": "REASONING_GROUP",
+        "StepTitle": "SKU Processing",
+        "StepConfig": {
+          "ReasoningGroupConfig": {
+            "loopConfig": {
+              "hasLoop": true,
+              "sourceCardIds": [
+                "70ee29c4-042a-4e7b-97b1-ec58c3a15964"
+              ]
+            }
+          }
+        },
+        "ChildSteps": [
+          {
+            "StepId": "165ed005-fad7-482a-a7df-d50107ddcd45",
+            "StepType": "QUICK_SUITE_DATA",
+            "StepTitle": "Lookup Suppliers",
+            "StepConfig": {
+              "QuickSuiteDataConfig": {
+                "prompt": "You are given a surging SKU with two integer fields: retailer_product_id and city_id from @70ee29c4-042a-4e7b-97b1-ec58c3a15964.  From the supplier availability data, return\u00a0 every supplier whose retailer_product_id AND city_id exactly equal those two values. For each supplier return: supplier_id, supplier_name, the total available_qty over the 7-day window, lead_time_days, and unit_cost. Sort by\u00a0unit_cost ascending. Do not reinterpret, split, or reformat any id \u2014 use the integer values exactly as given.",
+                "dataSources": [
+                  {
+                    "details": {
+                      "arn": "arn:aws:quicksight:<REGION>:<ACCOUNT_ID>:space/<QUICK_SUPPLIER_SPACE_ID>"
+                    },
+                    "type": "SPACE"
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "StepId": "f0f41494-5b9e-42ec-9170-e4898c7033ce",
+            "StepType": "GENERAL_KNOWLEDGE",
+            "StepTitle": "Select Best Supplier",
+            "StepConfig": {
+              "GeneralKnowledgeConfig": {
+                "prompt": "\u00a0Based on the demand forecast from @70ee29c4-042a-4e7b-97b1-ec58c3a15964 and the supplier data from @165ed005-fad7-482a-a7df-d50107ddcd45 :\u00a0\u00a0\n\u00a0You are given a surging SKU and a list of candidate suppliers, each with: supplier_id, total_available_qty (units available over the full 7-day window),\u00a0 lead_time_days, and unit_cost. You also have the SKU's forecast_7d_total.\nApply this EXACT decision rule. Do not invent any other criteria.\n\u00a0 1. A supplier \"covers demand\" if its total_available_qty >= forecast_7d_total. Compare the raw 7-day quantity directly. Do NOT prorate or scale the quantity by lead time, and do NOT multiply availability by any fraction. lead_time_days is informational only.\n\u00a0 2. Among the suppliers that cover demand, choose the one with the LOWEST unit_cost. That is the selected supplier. This is a routine order.\n\u00a0 3. Only if NO supplier covers demand (every supplier's total_available_qty is less than forecast_7d_total), mark the SKU as needing human review (exception).\u00a0\n\u00a0Do NOT consider surge volatility, safety buffers, multi-supplier splitting, or lead-time urgency. Output the selected supplier_id, unit_cost, quantity to order (round forecast_7d_total up to a whole number), region, city_id, retailer_product_id, and Order Type = \"routine\" or \"exception\".",
+                "modelCategory": "versatility-performance",
+                "modelConfig": {
+                  "textModelConfig": {
+                    "temperature": 0
+                  }
+                }
+              }
+            }
+          },
+          {
+            "StepId": "3d011f63-3480-4a6c-ae26-895ae140911d",
+            "StepType": "CONNECTOR_ACTIONS",
+            "StepTitle": "Submit Order\u00a0routine path",
+            "StepConfig": {
+              "ConnectorActionsConfig": {
+                "prompt": "Submit a routine purchase order by calling the submitOrder operation now. Do not describe or explain the call \u2014 actually invoke it. Use the selected supplier from @f0f41494-5b9e-42ec-9170-e4898c7033ce  and the SKU from @70ee29c4-042a-4e7b-97b1-ec58c3a15964. \n\nMap the body:  supplier_id, retailer_product_id, quantity (rounded-up demand), unit_cost, region, city_id, order_type = \"routine\". Invoke submitOrder and return order_id and status.\n\nOnly run if: Order Type = routine",
+                "actionConnectorId": "<OPENAPI_ACTION_CONNECTOR_ID>",
+                "actionConnectorType": "OPEN_API",
+                "actionId": "<OPENAPI_SUBMIT_ORDER_ACTION_ID>"
+              }
+            }
+          },
+          {
+            "StepId": "a2bf9640-dfee-437a-8c22-9366ad522571",
+            "StepType": "CONNECTOR_ACTIONS",
+            "StepTitle": "Raise Ticket exception path",
+            "StepConfig": {
+              "ConnectorActionsConfig": {
+                "prompt": "Raise a human-review ticket by calling the createTicket operation now. Do not describe or explain the call \u2014 actually invoke it. Use the SKU from @70ee29c4-042a-4e7b-97b1-ec58c3a15964 and the decision from @f0f41494-5b9e-42ec-9170-e4898c7033ce. \n\nMap the body:\u00a0 subject = \"Human review needed: no single supplier can cover the demand surge for product \" + retailer_product_id + \" in \" + region;\u00a0 description = short note that no single supplier's available qty covers the 7-day demand, with the demand qty and surge ratio; retailer_product_id; region; priority = \"High\"; category = \"supply-exception\". Invoke createTicket and return  ticket_id and status.\n\nOnly run if: Order Type = exception",
+                "actionConnectorId": "<OPENAPI_ACTION_CONNECTOR_ID>",
+                "actionConnectorType": "OPEN_API",
+                "actionId": "<OPENAPI_CREATE_TICKET_ACTION_ID>"
+              }
+            }
+          },
+          {
+            "StepId": "d43f205f-42a4-4d49-ab67-db97015aec9b",
+            "StepType": "GENERAL_KNOWLEDGE",
+            "StepTitle": "Generate SKU Summary",
+            "StepConfig": {
+              "GeneralKnowledgeConfig": {
+                "prompt": "Create a summary for the current SKU from @70ee29c4-042a-4e7b-97b1-ec58c3a15964  including: product/retailer_product_id, region, chosen supplier (if any), quantity, unit cost, and the action taken (order submitted with its order_id, or ticket raised with its ticket_id for human review).  Base the chosen supplier and action on @f0f41494-5b9e-42ec-9170-e4898c7033ce,\u00a0 @3d011f63-3480-4a6c-ae26-895ae140911d  and @a2bf9640-dfee-437a-8c22-9366ad522571 ",
+                "modelCategory": "versatility-performance",
+                "modelConfig": {
+                  "textModelConfig": {
+                    "temperature": 0
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      {
+        "StepId": "201e6159-4bc2-4243-8c40-e958b46f07d3",
+        "StepType": "GENERAL_KNOWLEDGE",
+        "StepTitle": "Generate Consolidated Report",
+        "StepConfig": {
+          "GeneralKnowledgeConfig": {
+            "prompt": "Compile all @d43f205f-42a4-4d49-ab67-db97015aec9b results into a comprehensive supply chain replenishment report. Include total number of SKUs processed, number of orders placed, number of tickets raised, and summary statistics. Format as a clear executive summary with detailed SKU-by-SKU breakdown.",
+            "modelCategory": "versatility-performance",
+            "modelConfig": {
+              "textModelConfig": {
+                "temperature": 0.2
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  "StepAliases": [
+    {
+      "StepId": "70ee29c4-042a-4e7b-97b1-ec58c3a15964",
+      "StepAlias": "detect-demand-surges"
+    },
+    {
+      "StepId": "70ee29c4-042a-4e7b-97b1-ec58c3a15964",
+      "StepAlias": "surging-sku"
+    },
+    {
+      "StepId": "165ed005-fad7-482a-a7df-d50107ddcd45",
+      "StepAlias": "lookup-suppliers"
+    },
+    {
+      "StepId": "f0f41494-5b9e-42ec-9170-e4898c7033ce",
+      "StepAlias": "select-best-supplier"
+    },
+    {
+      "StepId": "3d011f63-3480-4a6c-ae26-895ae140911d",
+      "StepAlias": "submit-order-routine-path"
+    },
+    {
+      "StepId": "a2bf9640-dfee-437a-8c22-9366ad522571",
+      "StepAlias": "raise-ticket-exception-path"
+    },
+    {
+      "StepId": "d43f205f-42a4-4d49-ab67-db97015aec9b",
+      "StepAlias": "generate-sku-summary"
+    },
+    {
+      "StepId": "201e6159-4bc2-4243-8c40-e958b46f07d3",
+      "StepAlias": "generate-consolidated-report"
+    }
+  ]
+}
