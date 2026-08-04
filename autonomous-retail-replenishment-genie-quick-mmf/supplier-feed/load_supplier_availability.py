@@ -4,28 +4,35 @@ Storyline: suppliers report daily stock availability per product and location; t
 that feed into Amazon S3 Tables. Amazon Quick later reads this (native S3 Tables Direct Query) alongside
 the Databricks Chronos-2 forecast (Genie MCP) to choose a supplier and act (order via the Supplier Order API).
 
-INDEPENDENCE: this loader has NO dependency on Databricks. It reads only the product/location KEYS from
-the same HuggingFace dataset (FreshRetailNet-50K) used by the original prep, and generates the supplier
+KEYS SOURCE: this loader reads only the retailer's product/location KEYS -- the distinct
+(product_id, city_id) pairs -- from the retailer's OWN raw history table in Databricks
+(mmf.fresh_retail_net.daily_sales_raw), via the Databricks SQL warehouse. It downloads NO third-party
+dataset; the licensed data already lives in the retailer's system. It then generates the supplier
 catalog itself. Suppliers use THEIR OWN product codes (`supplier_product_id`) and THEIR OWN descriptions
 (`supplier_product_desc`) which vary slightly per supplier -- exactly like real supplier catalogs. The
 shared reconciliation key is `retailer_product_id` (the retailer's product_id; a GTIN/UPC in production),
-which is how Quick matches a retailer SKU to supplier offers.
+which is how Quick matches a retailer SKU to supplier offers. (Keying the supplier feed to the retailer's
+product master is also how a real supplier-availability feed is built.)
 
 WRITE path: PyIceberg -> S3 Tables NATIVE Iceberg REST endpoint (signing-name=s3tables, SigV4). No
 analytics-services integration needed. Idempotent: re-runs drop+recreate the table.
 
-Run (ephemeral deps via uv; uses your AWS creds):
+Run (ephemeral deps via uv; uses your AWS creds + an authenticated Databricks CLI profile):
     eval "$(AWS_PROFILE=<YOUR_PROFILE> aws configure export-credentials --format env)"
-    AWS_ACCOUNT_ID=<ACCOUNT_ID> AWS_REGION=<REGION> uv run --python 3.11 \
+    AWS_ACCOUNT_ID=<ACCOUNT_ID> AWS_REGION=<REGION> S3T_BUCKET=<S3T_BUCKET> \
+    DBX_PROFILE=<DBX_PROFILE> WAREHOUSE_ID=<WAREHOUSE_ID> \
+        uv run --python 3.11 \
         --with 'pyiceberg[pyarrow]>=0.9,<0.10' --with 'pyarrow>=17,<22' \
-        --with boto3 --with requests --with huggingface_hub \
+        --with boto3 --with requests \
         load_supplier_availability.py
+
+    The loader shells out to the `databricks` CLI to read the keys, so the CLI must be installed and
+    DBX_PROFILE must be authenticated (`databricks auth login`) -- the same profile the notebooks use.
 """
 from __future__ import annotations
 import os
 import datetime as dt
 import pyarrow as pa
-import pyarrow.parquet as pq
 from pyiceberg.catalog import load_catalog
 
 # ---------------------------------------------------------------- config
@@ -46,10 +53,10 @@ S3T_REST_URI = f"https://s3tables.{REGION}.amazonaws.com/iceberg"
 WAREHOUSE_ARN = f"arn:aws:s3tables:{REGION}:{ACCOUNT}:bucket/{BUCKET}"
 
 FORECAST_DATES = [dt.date(2024, 6, 26) + dt.timedelta(days=i) for i in range(7)]
-HF_REPO = "Dingdong-Inc/FreshRetailNet-50K"
-# Pin to an immutable dataset revision (commit SHA) for reproducible, tamper-evident downloads.
-# Override with HF_REVISION=<sha|tag> if you need a different snapshot.
-HF_REVISION = os.environ.get("HF_REVISION", "08c1fab7f9257bc73679d415d65d644165d351d4")
+
+# The retailer's raw history table in Databricks (populated by the upstream MMF data-prep notebook).
+# We read only the distinct (product_id, city_id) KEYS from it -- no third-party dataset is downloaded.
+KEYS_TABLE = "mmf.fresh_retail_net.daily_sales_raw"
 
 # Geographic labels carried on the supplier feed (a real supplier feed names the city/region it serves).
 # Keyed by city_id; MUST match the retailer-side location_dim mapping so both sides share the same
@@ -91,22 +98,48 @@ SUP_BASE = {
 
 
 def get_retailer_product_city_keys() -> list[tuple[int, int]]:
-    """Distinct (retailer product_id, city_id) pairs from the HF FreshRetailNet parquet."""
-    from huggingface_hub import HfApi, hf_hub_download
-    api = HfApi()
-    files = [f for f in api.list_repo_files(HF_REPO, repo_type="dataset", revision=HF_REVISION) if f.endswith(".parquet")]
-    if not files:
-        raise SystemExit(f"No parquet files in HF dataset {HF_REPO}")
-    print(f"HF parquet files: {len(files)} (reading product/city keys)", flush=True)
-    pairs: set[tuple[int, int]] = set()
-    for fp in files:
-        # nosec B615 - revision is pinned: HF_REVISION defaults to an immutable commit SHA (env-overridable).
-        local = hf_hub_download(HF_REPO, fp, repo_type="dataset", revision=HF_REVISION)  # nosec B615
-        t = pq.read_table(local, columns=["product_id", "city_id"])
-        for pid, city in zip(t.column("product_id").to_pylist(), t.column("city_id").to_pylist()):
-            pairs.add((int(pid), int(city)))
-    print(f"distinct (retailer product_id, city_id): {len(pairs):,}", flush=True)
-    return sorted(pairs)
+    """Distinct (retailer product_id, city_id) pairs from the retailer's OWN raw history table in
+    Databricks (KEYS_TABLE), read via the SQL warehouse's Statement Execution API. Downloads NO
+    third-party dataset -- the keys come from the retailer's system, where the licensed data lives."""
+    import json
+    import subprocess  # nosec B404 - used only to invoke the databricks CLI with a fixed arg list (no shell)
+    profile = os.environ.get("DBX_PROFILE")
+    warehouse = os.environ.get("WAREHOUSE_ID")
+    if not profile or not warehouse:
+        raise SystemExit("Set DBX_PROFILE (an authenticated `databricks auth login` profile) and "
+                         "WAREHOUSE_ID (your Serverless SQL warehouse id) so the loader can read the "
+                         f"product/location keys from {KEYS_TABLE}.")
+    req = {
+        "warehouse_id": warehouse,
+        # Static, literal query: fixed table name, no parameters, no user input, no string
+        # interpolation -- there is no SQL-injection surface here.
+        "statement": "SELECT DISTINCT product_id, city_id FROM mmf.fresh_retail_net.daily_sales_raw",
+        "wait_timeout": "50s", "disposition": "INLINE", "format": "JSON_ARRAY",
+    }
+    print("Reading distinct (product_id, city_id) keys from", KEYS_TABLE, "via Databricks ...", flush=True)
+    # nosec B603 - fixed argument list, no shell; statement is a hardcoded constant (no user input).
+    proc = subprocess.run(
+        ["databricks", "api", "post", "/api/2.0/sql/statements", "--profile", profile,
+         "--json", json.dumps(req)],
+        capture_output=True, text=True)  # nosec B603
+    if proc.returncode != 0:
+        raise SystemExit(f"databricks CLI call failed (profile '{profile}'):\n{proc.stderr.strip()}")
+    resp = json.loads(proc.stdout)
+    state = (resp.get("status") or {}).get("state")
+    if state != "SUCCEEDED":
+        raise SystemExit(f"Databricks statement did not succeed (state={state}): "
+                         f"{(resp.get('status') or {}).get('error', {})}")
+    result = resp.get("result") or {}
+    if result.get("next_chunk_internal_link"):
+        # Not expected for this small key set (single chunk), but fail loud rather than truncate.
+        raise SystemExit("Key result was chunked unexpectedly; increase result handling before use.")
+    rows = result.get("data_array") or []
+    pairs = sorted({(int(p), int(c)) for p, c in rows})
+    if not pairs:
+        raise SystemExit(f"No (product_id, city_id) pairs returned from {KEYS_TABLE} -- did the "
+                         "upstream MMF data-prep notebook (01) run and populate mmf.fresh_retail_net?")
+    print(f"distinct (retailer product_id, city_id) from Databricks: {len(pairs):,}", flush=True)
+    return pairs
 
 
 def supplier_sku_and_desc(retailer_pid: int, tag: str) -> tuple[str, str]:

@@ -89,9 +89,11 @@ You run this in **your own** environment. Before starting you need:
   source, the Order API action, and Quick Flows. If you don't already have a Quick account, provision
   it first per **`docs/QUICK_ACCOUNT_SETUP_RUNBOOK.md`** (its home region is fixed at sign-up).
 - **Local tools:** AWS CLI **v2.36.2+** (the Amazon Quick `create-agent`/`create-action-connector`/
-  `create-flow` verbs require a recent release), the **Databricks CLI v0.299.0+**, `jq`, `uv` (or
-  Python 3.11) for the supplier-feed loader, and network access to Hugging Face (the upstream MMF
-  data-prep notebook downloads the FreshRetailNet-50K dataset).
+  `create-flow` verbs require a recent release), the **Databricks CLI v0.299.0+**, `jq`, and `uv` (or
+  Python 3.11) for the supplier-feed loader — which reads its product/location keys from your Databricks
+  workspace (`mmf.fresh_retail_net.daily_sales_raw`) via the SQL warehouse, so it downloads no dataset.
+  Note: the **upstream** MMF data-prep notebook (not shipped here) needs network access to Hugging Face
+  to download the FreshRetailNet-50K dataset.
 
 ## Quickstart (build order)
 Follow these steps in order. First run the **upstream MMF forecast notebooks (01 data-prep → 02

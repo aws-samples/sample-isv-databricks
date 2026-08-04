@@ -60,14 +60,19 @@ order_api() {
 
 feed() {
   log "Create S3 Tables bucket + load supplier feed"
-  require_vars "S3T_BUCKET:name for the S3 Tables supplier bucket"
+  # The loader reads the (product_id, city_id) keys from the retailer's Databricks table
+  # (mmf.fresh_retail_net.daily_sales_raw) via the SQL warehouse -- no third-party dataset download.
+  require_vars "S3T_BUCKET:name for the S3 Tables supplier bucket" \
+    "DBX_PROFILE:authenticated Databricks CLI profile (loader reads product/location keys)" \
+    "WAREHOUSE_ID:Serverless SQL warehouse id the loader queries"
   aws s3tables create-table-bucket --name "$S3T_BUCKET" --region "$REGION" --profile "$AWS_PROFILE_SC" 2>&1 \
     | grep -v 'BucketAlreadyExists' || echo "(bucket may already exist — continuing)"
   eval "$(AWS_PROFILE="$AWS_PROFILE_SC" aws configure export-credentials --format env)"
   AWS_ACCOUNT_ID="$ACCOUNT_ID" AWS_REGION="$REGION" S3T_BUCKET="$S3T_BUCKET" \
+    DBX_PROFILE="$DBX_PROFILE" WAREHOUSE_ID="$WAREHOUSE_ID" \
     uv run --python 3.11 \
     --with 'pyiceberg[pyarrow]>=0.9,<0.10' --with 'pyarrow>=17,<22' \
-    --with boto3 --with requests --with huggingface_hub \
+    --with boto3 --with requests \
     supplier-feed/load_supplier_availability.py
   aws s3tables list-tables --table-bucket-arn "$BUCKET_ARN" --namespace supply_chain \
     --region "$REGION" --profile "$AWS_PROFILE_SC"

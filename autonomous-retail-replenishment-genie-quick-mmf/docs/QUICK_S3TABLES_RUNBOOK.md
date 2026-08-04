@@ -22,14 +22,18 @@ aws s3tables create-table-bucket --name <S3T_BUCKET> --region <REGION>
 ```
 
 Then run the loader (creates the `supply_chain` namespace + `supplier_availability` table and loads
-rows). It requires `AWS_ACCOUNT_ID`; override `S3T_BUCKET` if you used a different bucket name:
+rows). The loader reads the distinct `(product_id, city_id)` keys from the retailer's own Databricks
+table (`mmf.fresh_retail_net.daily_sales_raw`) via the SQL warehouse — it downloads no third-party
+dataset — so it needs `DBX_PROFILE` (an authenticated `databricks auth login` profile) and
+`WAREHOUSE_ID` in addition to `AWS_ACCOUNT_ID`; override `S3T_BUCKET` if you used a different bucket name:
 
 ```bash
 eval "$(AWS_PROFILE=<your-profile> aws configure export-credentials --format env)"
 AWS_ACCOUNT_ID=<ACCOUNT_ID> AWS_REGION=<REGION> S3T_BUCKET=<S3T_BUCKET> \
+DBX_PROFILE=<DBX_PROFILE> WAREHOUSE_ID=<WAREHOUSE_ID> \
   uv run --python 3.11 \
   --with 'pyiceberg[pyarrow]>=0.9,<0.10' --with 'pyarrow>=17,<22' \
-  --with boto3 --with requests --with huggingface_hub \
+  --with boto3 --with requests \
   supplier-feed/load_supplier_availability.py
 ```
 
