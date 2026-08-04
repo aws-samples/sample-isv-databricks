@@ -2,10 +2,16 @@
 # Databricks-side setup for the autonomous supply chain solution.
 #
 # Runs the CLI-automatable Databricks steps in order:
-#   1. Import the forecasting notebooks (Git folder)
-#   2. Run notebooks 01 -> 02 -> 04 -> 03 (delegates to notebooks/run_notebook.sh)
+#   1. Import this repo's notebooks as a Databricks Git folder
+#   2. Run notebooks 04 (Genie views) -> 03 (dims) (delegates to notebooks/run_notebook.sh)
 #   3. Create the Genie Agent (SQL warehouse + genie create-space from genie/genie_space.json)
 #   4. Register the Databricks OAuth app for Amazon Quick (account-admin)
+#
+# PRECONDITION: the Chronos-2 forecast tables must already exist. The data-prep and
+# forecast notebooks (01, 02) are NOT in this repo — they live in the upstream Databricks
+# Many Model Forecasting accelerator (databricks-industry-solutions/many-model-forecasting,
+# examples/fresh_retail_net). Run those there first (01 -> 02, 02 on Serverless GPU), then
+# run this script's notebooks (04 -> 03).
 #
 # All values come from .supply-chain-automation-env (source it first). No hardcoded values.
 # Requires: databricks CLI v0.299.0+, jq. Run from the repository root.
@@ -30,9 +36,10 @@ require_vars \
   "WORKSPACE_USER:from databricks auth describe (the User line)" \
   "WORKSPACE_HOST:workspace host, no https:// (dbc-xxxx.cloud.databricks.com)"
 
-REPO_URL="${REPO_URL:-https://github.com/databricks-industry-solutions/many-model-forecasting.git}"
+REPO_URL="${REPO_URL:-https://github.com/aws-samples/isv-databricks-samples.git}"
 NB_ROOT="${NB_ROOT:-/Workspace/Users/${WORKSPACE_USER}}"
-REPO_NAME="${REPO_NAME:-many-model-forecasting}"
+REPO_NAME="${REPO_NAME:-isv-databricks-samples}"
+NB_SUBDIR="${NB_SUBDIR:-autonomous-retail-replenishment-genie-quick-mmf/notebooks}"
 RUN_NB="${SCRIPT_DIR}/../notebooks/run_notebook.sh"
 GENIE_ARTIFACT="${GENIE_ARTIFACT:-genie/genie_space.json}"
 PHASE="${1:-all}"
@@ -40,21 +47,25 @@ PHASE="${1:-all}"
 
 # ---- 1. import notebooks --------------------------------------------------
 import_notebooks() {
-  log "1. Import forecasting notebooks -> ${NB_ROOT}/${REPO_NAME}"
+  log "1. Import this repo's notebooks -> ${NB_ROOT}/${REPO_NAME}/${NB_SUBDIR}"
+  echo "NOTE: this imports notebooks 03/04 only. The Chronos-2 forecast tables must"
+  echo "      already exist — run the upstream MMF data-prep + forecast notebooks (01, 02)"
+  echo "      from the accelerator first:"
+  echo "      https://github.com/databricks-industry-solutions/many-model-forecasting/tree/main/examples/fresh_retail_net"
   if databricks workspace list "${NB_ROOT}/${REPO_NAME}" --profile "$DBX_PROFILE" >/dev/null 2>&1; then
     echo "Git folder already present at ${NB_ROOT}/${REPO_NAME} — skipping import."
   else
     databricks repos create "$REPO_URL" gitHub \
       --path "${NB_ROOT}/${REPO_NAME}" --profile "$DBX_PROFILE"
   fi
-  databricks workspace list "${NB_ROOT}/${REPO_NAME}/examples/fresh_retail_net" --profile "$DBX_PROFILE"
+  databricks workspace list "${NB_ROOT}/${REPO_NAME}/${NB_SUBDIR}" --profile "$DBX_PROFILE"
 }
 
-# ---- 2. run notebooks 01 -> 02 -> 04 -> 03 --------------------------------
+# ---- 2. run notebooks 04 -> 03 --------------------------------------------
 run_notebooks() {
-  log "2. Run notebooks 01 -> 02 -> 04 -> 03 (serverless; 02 on GPU)"
+  log "2. Run notebooks 04 -> 03 (serverless). Forecast tables (upstream 01, 02) must already exist."
   [[ -x "$RUN_NB" ]] || { echo "ERROR: $RUN_NB not found/executable" >&2; exit 1; }
-  for nb in 01 02 04 03; do
+  for nb in 04 03; do
     echo ">>> notebook ${nb}"
     "$RUN_NB" "$nb"
   done

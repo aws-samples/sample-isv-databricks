@@ -1,12 +1,14 @@
 # Databricks Genie Space — Creation Runbook
 
 Creates the **Fresh Retail Sales Forecasting** Genie Space that Amazon Quick queries over MCP.
-Do this AFTER notebooks `01 → 02 → 04 → 03` have run (the space's tables/views must exist).
+Do this AFTER the upstream MMF forecast notebooks (`01 → 02`) and this repo's notebooks (`04 → 03`)
+have run (the space's tables/views must exist).
 Console steps are in the Databricks workspace UI.
 
 ## Prerequisites
-- Notebooks run in this order: `01` (data prep) → `02` (forecast) → `04` (Genie views) → `03` (dims).
-  The tables/views below must already exist in catalog `mmf`, schema `fresh_retail_net`.
+- Run order: upstream MMF `01` (data prep) → `02` (forecast), then this repo's `04` (Genie views) →
+  `03` (dims). The `01`/`02` notebooks live in the [MMF accelerator](https://github.com/databricks-industry-solutions/many-model-forecasting/tree/main/examples/fresh_retail_net),
+  not this repo. The tables/views below must already exist in catalog `mmf`, schema `fresh_retail_net`.
 - A **Serverless SQL Warehouse** the space will run on. This repo uses one named `supply-chain-genie`.
   Create one via **SQL → SQL Warehouses → Create** (Serverless), or reuse an existing serverless
   warehouse. Note its **warehouse id** (`<WAREHOUSE_ID>`) — you'll need it for the connector.
@@ -28,8 +30,8 @@ In the space → **Data** (or **Add tables**), add exactly these **6** objects f
 
 | # | Object | Created by | Purpose |
 |---|---|---|---|
-| 1 | `daily_sales_raw` | notebook 01 | raw daily sales (actuals) |
-| 2 | `demand_train` | notebook 01 | training history (per-SKU daily) |
+| 1 | `daily_sales_raw` | upstream MMF nb 01 | raw daily sales (actuals) |
+| 2 | `demand_train` | upstream MMF nb 01 | training history (per-SKU daily) |
 | 3 | `scoring_output_mv` | notebook 04 | exploded Chronos-2 forecasts (one row per SKU per forecast date) |
 | 4 | `evaluation_metrics_mv` | notebook 04 | backtest accuracy metrics |
 | 5 | `product_dim` | notebook 03 | product_id → name / category / brand |

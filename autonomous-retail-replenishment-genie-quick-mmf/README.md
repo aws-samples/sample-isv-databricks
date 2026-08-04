@@ -17,9 +17,12 @@ It demonstrates a closed detect → decide → act loop:
 4. **Act** — Amazon Quick Flows submits a routine purchase order, or raises a human-review ticket
    for exceptions, through a Supplier Order API. On a schedule, the loop runs unattended.
 
-> **Forecasting notebooks live in the official Databricks accelerator.** Notebooks 01–04 are
-> maintained in the [Databricks Many Model Forecasting repo](https://github.com/databricks-industry-solutions/many-model-forecasting/tree/main/examples/fresh_retail_net)
-> (the canonical source). Copies are included in this repo for convenience.
+> **Forecasting notebooks live in the official Databricks accelerator.** The data-prep and
+> Chronos-2 forecast notebooks (01, 02) are **not** included here — run them from the
+> [Databricks Many Model Forecasting accelerator](https://github.com/databricks-industry-solutions/many-model-forecasting/tree/main/examples/fresh_retail_net)
+> (the canonical source) to produce the forecast tables. This repo ships only the two
+> AWS-authored notebooks that build on those tables: **04** (Genie views) and **03**
+> (product/location dimensions).
 
 > **Note on data and names.** FreshRetailNet-50K is anonymized; product, location, and supplier
 > names in this demo (e.g. "Skim Milk", "Boston/Northeast", "Supplier S2") are **illustrative
@@ -51,7 +54,8 @@ not just do it all in Databricks?": the supplier feed is an external operational
 
 ## Repo layout
 ```
-notebooks/        Databricks notebooks: data prep, MMF/Chronos-2 forecast, dimension tables, Genie views
+notebooks/        AWS-authored Databricks notebooks: 04 Genie views, 03 product/location dims
+                  (data-prep + Chronos-2 forecast notebooks 01/02 live in the upstream MMF accelerator — run those first)
   run_notebook.sh parameterized Databricks job runner (submit → poll → report; handles nb04 MODEL_FILTER)
 supplier-feed/    load_supplier_availability.py — independent S3 Tables loader (PyIceberg)
 order-api/        CloudFormation + OpenAPI spec for the mock external Supplier Order API
@@ -79,28 +83,33 @@ You run this in **your own** environment. Before starting you need:
   create S3 Tables buckets, and to deploy API Gateway, Lambda, DynamoDB, Secrets Manager, and IAM
   roles via CloudFormation.
 - **Databricks workspace** with Unity Catalog, a **Serverless SQL Warehouse**, and **Serverless GPU**
-  (A10) for the Chronos-2/MMF run in notebook 02. `CREATE CATALOG` on the metastore (or an admin to
-  pre-create the `mmf` catalog).
+  (A10) for the Chronos-2/MMF forecast run (upstream notebook 02). `CREATE CATALOG` on the metastore
+  (or an admin to pre-create the `mmf` catalog).
 - **Amazon Quick** (Author/Author Pro) in `<REGION>` — for the Genie MCP connector, S3 Tables data
   source, the Order API action, and Quick Flows. If you don't already have a Quick account, provision
   it first per **`docs/QUICK_ACCOUNT_SETUP_RUNBOOK.md`** (its home region is fixed at sign-up).
 - **Local tools:** AWS CLI **v2.36.2+** (the Amazon Quick `create-agent`/`create-action-connector`/
   `create-flow` verbs require a recent release), the **Databricks CLI v0.299.0+**, `jq`, `uv` (or
-  Python 3.11) for the supplier-feed loader, and network access to Hugging Face (the notebooks download
-  the FreshRetailNet-50K dataset).
+  Python 3.11) for the supplier-feed loader, and network access to Hugging Face (the upstream MMF
+  data-prep notebook downloads the FreshRetailNet-50K dataset).
 
 ## Quickstart (build order)
-Follow these steps in order. Notebooks run **01 → 02 → 04 → 03** (notebook 03's validation cell joins a
-view that notebook 04 creates). Import the `.ipynb` files into your Databricks workspace and run each on
-the compute noted in its first cell. Steps 8–13 use the AWS CLI (`quicksight` verbs) unless noted as
-console-only; substitute your `<PLACEHOLDER>` values throughout.
+Follow these steps in order. First run the **upstream MMF forecast notebooks (01 data-prep → 02
+Chronos-2 forecast)** from the [accelerator](https://github.com/databricks-industry-solutions/many-model-forecasting/tree/main/examples/fresh_retail_net)
+to produce the forecast tables, then run **this repo's notebooks 04 → 03** (notebook 03's validation cell
+joins a view that notebook 04 creates). Import the `.ipynb` files into your Databricks workspace and run
+each on the compute noted in its first cell. Steps 8–13 use the AWS CLI (`quicksight` verbs) unless noted
+as console-only; substitute your `<PLACEHOLDER>` values throughout.
 
 1. **Provision Amazon Quick** — if you don't already have a Quick account, create it first (its home
    region is fixed at sign-up). See **`docs/QUICK_ACCOUNT_SETUP_RUNBOOK.md`**.
-2. **Forecast** — run `notebooks/01` (data prep → catalog `mmf`, schema `fresh_retail_net`) then
-   `notebooks/02` on **Serverless GPU** (Chronos-2 via MMF). Expected: 1,000 SKUs, forecast + eval tables.
-   You can drive the runs with `notebooks/run_notebook.sh <nb>` (parameterized Databricks job runner).
+2. **Forecast (upstream)** — from the [MMF accelerator](https://github.com/databricks-industry-solutions/many-model-forecasting/tree/main/examples/fresh_retail_net),
+   run its data-prep notebook (→ catalog `mmf`, schema `fresh_retail_net`) then its Chronos-2 forecast
+   notebook on **Serverless GPU**. Expected: 1,000 SKUs, forecast + eval tables. These notebooks are not
+   shipped here — follow the accelerator's own instructions.
 3. **Views + Dimensions** — run `notebooks/04` (Genie views) then `notebooks/03` (product/location dims).
+   Drive the runs with `notebooks/run_notebook.sh 04` then `notebooks/run_notebook.sh 03` (parameterized
+   Databricks job runner).
    Notebook 04 scopes the Genie views to Chronos-2 (`MODEL_FILTER="Chronos2"`) for this walkthrough; set
    `MODEL_FILTER=None` to expose all models MMF ran and enable model-comparison questions.
 4. **Genie Agent** — create the agent, add its six tables, paste `genie/genie_instructions.md`, and pin
@@ -150,7 +159,6 @@ Find them all with: `grep -rn "<[A-Z_]*>" .`
 | `<OPENAPI_SUBMIT_ORDER_ACTION_ID>` / `<OPENAPI_CREATE_TICKET_ACTION_ID>` | OpenAPI action ids | connector Test action, or `describe-action-connector` |
 | `<DATASET_ID>` | supplier_availability dataset id | `aws quicksight list-data-sets` (step 11) |
 | `<QUICK_SUPPLIER_SPACE_ID>` | Quick space holding the dataset | you set it in `create-space` (step 12) |
-| `<EXPERIMENT_ID>` | MLflow experiment id (notebook 02 metadata) | your workspace after running nb02 |
 | `<API_ID>` | API Gateway id in the Order API base URL | CloudFormation stack output (step 5) |
 | `<S3T_BUCKET>` | your S3 Tables bucket name | you choose it (step 4) |
 | `<BUCKET_ARN>` | full S3 Tables bucket ARN | `arn:aws:s3tables:<REGION>:<ACCOUNT_ID>:bucket/<S3T_BUCKET>` |

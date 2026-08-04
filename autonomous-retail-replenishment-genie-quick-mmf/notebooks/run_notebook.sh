@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# Run one Many Model Forecasting notebook as a one-time Databricks Serverless job.
+# Run one of this repo's Databricks notebooks (04 Genie views, 03 dims) as a
+# one-time Databricks Serverless job.
 #
 # Submits the notebook with the Databricks CLI, captures the run id, polls until the
-# run terminates, and reports the result. Serverless GPU (notebook 02) is inherited
-# automatically from the notebook's own compute metadata — no accelerator block needed.
+# run terminates, and reports the result. These notebooks run on plain Serverless
+# compute — no accelerator needed.
+#
+# The data-prep and Chronos-2 forecast notebooks (01, 02) are NOT shipped here; they
+# live in the upstream Databricks Many Model Forecasting accelerator:
+#   https://github.com/databricks-industry-solutions/many-model-forecasting/tree/main/examples/fresh_retail_net
+# Run those there first (01 -> 02, 02 on Serverless GPU) so the forecast tables exist,
+# then run this repo's notebooks (04 -> 03).
 #
 # Prerequisites (set once, then `source` it — see the walkthrough):
 #   DBX_PROFILE      Databricks workspace CLI profile (from `databricks auth login`)
@@ -13,15 +20,16 @@
 # The notebook location is derived from (override any of these if you imported the
 # Git folder elsewhere; defaults match this solution's import step):
 #   NB_ROOT      workspace root that holds the Git folder  [default /Workspace/Users/$WORKSPACE_USER]
-#   REPO_NAME    the imported Git folder name              [default many-model-forecasting]
-#   REPO_SUBDIR  path within the repo to the notebooks     [default examples/fresh_retail_net]
+#   REPO_NAME    the imported Git folder name              [default isv-databricks-samples]
+#   REPO_SUBDIR  path within the repo to the notebooks     [default autonomous-retail-replenishment-genie-quick-mmf/notebooks]
 #
 # Usage:
-#   ./run_notebook.sh 01          # run notebook 01 by number
-#   ./run_notebook.sh 02          # notebook 02 (Serverless GPU, inherited)
+#   ./run_notebook.sh 04          # run notebook 04 by number
+#   ./run_notebook.sh 03          # run notebook 03 by number
 #   ./run_notebook.sh 04_genie_views_setup   # or by full notebook name
 #
-# Run order for this solution: 01 -> 02 -> 04 -> 03.
+# Run order for this repo's notebooks: 04 -> 03 (03's validation cell joins a view
+# that 04 creates). Run the upstream MMF forecast notebooks (01 -> 02) BEFORE these.
 #
 # Notebook 04 exposes a MODEL_FILTER variable. This solution uses Chronos-2 only, so
 # before submitting 04 this script exports the notebook, sets MODEL_FILTER accordingly,
@@ -43,8 +51,6 @@ ARG="$1"
 
 # Map a bare number (01..04) to the full notebook name; otherwise use the arg as-is.
 case "$ARG" in
-  01) NB="01_fresh_retail_net_data_prep" ;;
-  02) NB="02_fresh_retail_net_mmf_forecast" ;;
   03) NB="03_build_product_location_dims" ;;
   04) NB="04_genie_views_setup" ;;
   *)  NB="$ARG" ;;
@@ -52,8 +58,8 @@ esac
 
 # Notebook location — each segment overridable; defaults match the import step.
 NB_ROOT="${NB_ROOT:-/Workspace/Users/${WORKSPACE_USER}}"
-REPO_NAME="${REPO_NAME:-many-model-forecasting}"
-REPO_SUBDIR="${REPO_SUBDIR:-examples/fresh_retail_net}"
+REPO_NAME="${REPO_NAME:-isv-databricks-samples}"
+REPO_SUBDIR="${REPO_SUBDIR:-autonomous-retail-replenishment-genie-quick-mmf/notebooks}"
 NB_PATH="${NB_ROOT}/${REPO_NAME}/${REPO_SUBDIR}/${NB}"
 POLL_SECONDS="${POLL_SECONDS:-20}"
 
