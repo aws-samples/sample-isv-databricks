@@ -1,0 +1,12 @@
+# CODEOWNERS — enforces that only the isv-databricks maintainers can approve changes.
+# GitHub requires a matching review from a code owner before a PR to a protected branch can merge,
+# which makes this repository the single source of *authorized* AWS + Databricks samples.
+#
+# TODO before publish: replace the team below with the real aws-samples GitHub team once created,
+# or list the select-few maintainer handles explicitly (e.g. @alias1 @alias2).
+
+# All files require review from the isv-databricks maintainers.
+*       @aws-samples/isv-databricks
+
+# Each sample may additionally name its own maintainers on the line below it, e.g.:
+# /autonomous-retail-replenishment-genie-quick-mmf/   @aws-samples/isv-databricks
