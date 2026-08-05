@@ -63,6 +63,7 @@ genie/            Genie space instructions + the pinned surge trusted query + de
 flow/             flow_definition.json (create-flow input) + flow_build_guide.md (step-by-step build)
 docs/             setup runbooks (Quick account, Genie space, Quick connector, S3 Tables, order/ticket action, end-to-end test) + cost/cleanup
 cleanup/          cleanup.sh — tears down all AWS + Databricks resources created by the walkthrough
+smoketest/        local_logic_smoketest.py — offline DETECT→DECIDE logic check (no live infra)
 ```
 
 ## Prerequisites
