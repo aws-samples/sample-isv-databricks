@@ -1,0 +1,16 @@
+# Generated at deploy time — holds the Cognito client secret, gateway/target/provider
+# ARNs and the AWS account id. Never commit.
+gateway_config.json
+
+# Written by `agentcore configure` / `agentcore deploy` — runtime/agent ARNs, ECR uri.
+.bedrock_agentcore.yaml
+
+# Local secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/

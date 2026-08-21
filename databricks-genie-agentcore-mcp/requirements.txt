@@ -1,0 +1,7 @@
+strands-agents
+strands-agents-tools
+bedrock-agentcore
+mcp
+boto3
+requests
+pyyaml
