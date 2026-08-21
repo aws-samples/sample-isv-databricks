@@ -132,44 +132,45 @@ class GatewaySetup:
         """
         role_name = role_arn.split("/")[-1]
         arn_prefix = f"arn:aws:bedrock-agentcore:{self.region}:{self.account_id}"
-        policy_doc = json.dumps(
+        statements = [
             {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": [
-                            "bedrock-agentcore:GetWorkloadAccessToken",
-                            "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
-                        ],
-                        "Resource": [
-                            f"{arn_prefix}:workload-identity-directory/default",
-                            f"{arn_prefix}:workload-identity-directory/default/workload-identity/*",
-                        ],
-                    },
-                    {
-                        # GetResourceOauth2Token is authorized against several
-                        # resources in turn — the credential provider, the token
-                        # vault that holds it, AND the gateway's workload identity.
-                        # Scoping it to the provider alone fails at tool-invocation
-                        # time with a 403 from AgentCredentialProvider.
-                        "Effect": "Allow",
-                        "Action": "bedrock-agentcore:GetResourceOauth2Token",
-                        "Resource": [
-                            provider_arn,
-                            f"{arn_prefix}:token-vault/default",
-                            f"{arn_prefix}:workload-identity-directory/default",
-                            f"{arn_prefix}:workload-identity-directory/default/workload-identity/*",
-                        ],
-                    },
-                    {
-                        "Effect": "Allow",
-                        "Action": "secretsmanager:GetSecretValue",
-                        "Resource": secret_arn or "*",
-                    },
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock-agentcore:GetWorkloadAccessToken",
+                    "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
                 ],
-            }
-        )
+                "Resource": [
+                    f"{arn_prefix}:workload-identity-directory/default",
+                    f"{arn_prefix}:workload-identity-directory/default/workload-identity/*",
+                ],
+            },
+            {
+                # GetResourceOauth2Token is authorized against several
+                # resources in turn — the credential provider, the token
+                # vault that holds it, AND the gateway's workload identity.
+                # Scoping it to the provider alone fails at tool-invocation
+                # time with a 403 from AgentCredentialProvider.
+                "Effect": "Allow",
+                "Action": "bedrock-agentcore:GetResourceOauth2Token",
+                "Resource": [
+                    provider_arn,
+                    f"{arn_prefix}:token-vault/default",
+                    f"{arn_prefix}:workload-identity-directory/default",
+                    f"{arn_prefix}:workload-identity-directory/default/workload-identity/*",
+                ],
+            },
+        ]
+        # Only grant secret read when we have the specific ARN — never fall
+        # back to "*", which would let the role read every secret in the account.
+        if secret_arn:
+            statements.append(
+                {
+                    "Effect": "Allow",
+                    "Action": "secretsmanager:GetSecretValue",
+                    "Resource": secret_arn,
+                }
+            )
+        policy_doc = json.dumps({"Version": "2012-10-17", "Statement": statements})
         self.iam.put_role_policy(RoleName=role_name, PolicyName=policy_name, PolicyDocument=policy_doc)
         print(f"  Updated role: {role_name}")
         time.sleep(10)

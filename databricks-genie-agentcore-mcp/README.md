@@ -1,6 +1,6 @@
 # Databricks Genie via Amazon Bedrock AgentCore Gateway (MCP)
 
-Expose a [Databricks Genie](https://docs.databricks.com/en/genie/index.html) space as a governed MCP tool to AI agents through [Amazon Bedrock AgentCore Gateway](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway.html), with the agent hosted on [AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime.html). Agents ask plain-English business questions; Genie returns lakehouse-native SQL answers grounded in Unity Catalog. The gateway authenticates to Databricks as a service principal (machine-to-machine), so queries run with — and are audited under — that service principal's Unity Catalog permissions. For per-user identity and attribution, see the [per-user delegation sample](../databricks-dbsql-per-user-delegation).
+Expose a [Databricks Genie](https://docs.databricks.com/en/genie/index.html) space as a governed MCP tool to AI agents through [Amazon Bedrock AgentCore Gateway](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway.html), with the agent hosted on [AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime.html). Agents ask plain-English business questions; Genie returns lakehouse-native SQL answers grounded in Unity Catalog. The gateway authenticates to Databricks as a service principal (machine-to-machine), so queries run with — and are audited under — that service principal's Unity Catalog permissions.
 
 ![Databricks Genie via Amazon Bedrock AgentCore Gateway architecture](images/architecture.png)
 
@@ -16,12 +16,7 @@ This sample registers the [Databricks-managed Genie MCP endpoint](https://docs.d
 - **Outbound auth** — Databricks OAuth2 M2M credentials, registered via `CreateOauth2CredentialProvider` (scoped to `genie`) and retrieved by Gateway at tool-invocation time
 - **Audit** — Unity Catalog audit logs attribute SQL execution to the service principal; AgentCore Runtime and Gateway emit CloudWatch traces for each tool invocation
 
-> **Auth model.** This sample uses machine-to-machine (client-credentials) auth end to end, so Genie runs as the service principal — the right model for a shared, application-level integration where every caller shares one permission set. The same `mcpServer` target also supports per-user access via OAuth token exchange (`grantType: TOKEN_EXCHANGE`) or authorization code, in which case Unity Catalog enforces each end user's own permissions; see the [outbound authorization matrix](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-outbound-auth.html) for what each target type supports, and [`databricks-dbsql-per-user-delegation`](../databricks-dbsql-per-user-delegation) for the RFC 8693 setup.
-
-This sample complements the existing Databricks integrations in this folder:
-
-- [`databricks-dbsql-agentcore-gateway`](../databricks-dbsql-agentcore-gateway) — Databricks SQL MCP with M2M auth
-- [`databricks-dbsql-per-user-delegation`](../databricks-dbsql-per-user-delegation) — Per-user delegation via RFC 8693 token exchange
+> **Auth model.** This sample uses machine-to-machine (client-credentials) auth end to end, so Genie runs as the service principal — the right model for a shared, application-level integration where every caller shares one permission set. The same `mcpServer` target also supports per-user access via OAuth token exchange (`grantType: TOKEN_EXCHANGE`) or authorization code, in which case Unity Catalog enforces each end user's own permissions; see the [outbound authorization matrix](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-outbound-auth.html) for what each target type supports.
 
 ## Prerequisites
 
@@ -177,6 +172,11 @@ python cleanup.py      # remove the target, credential provider, gateway, IAM ro
 - [Amazon Bedrock AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime.html)
 - [Strands Agents](https://strandsagents.com/)
 - [AgentCore Gateway tutorials](https://github.com/awslabs/agentcore-samples/tree/main/01-tutorials/02-AgentCore-gateway)
+
+## Security disclaimer
+
+This is sample code, for non-production usage. You should work with your security and legal teams
+to meet your organizational security, regulatory and compliance requirements before deployment.
 
 ## License
 MIT-0. See `LICENSE`.
