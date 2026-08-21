@@ -244,7 +244,7 @@ a(
 )
 a(
     f'<text x="1052" y="793" font-size="14" fill="{MUTED}">'
-    f"For per-user identity and attribution, see databricks-dbsql-per-user-delegation.</text>"
+    f"For per-user identity and attribution, see the Auth model note in the README.</text>"
 )
 
 a("</svg>")

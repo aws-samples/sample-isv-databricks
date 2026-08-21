@@ -73,5 +73,5 @@
 <path d="M 1240 600 L 1490 600" fill="none" stroke="#57728B" stroke-width="2" marker-end="url(#ah)"/>
 <text x="1365" y="590" font-size="14" fill="#232F3E" text-anchor="middle">authorized read</text>
 <text x="1052" y="772" font-size="14" fill="#5A6B7B">Unity Catalog enforces the service principal’s permissions and audits SQL under that identity.</text>
-<text x="1052" y="793" font-size="14" fill="#5A6B7B">For per-user identity and attribution, see databricks-dbsql-per-user-delegation.</text>
+<text x="1052" y="793" font-size="14" fill="#5A6B7B">For per-user identity and attribution, see the Auth model note in the README.</text>
 </svg>
