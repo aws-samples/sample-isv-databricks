@@ -10,6 +10,7 @@ is not in this repository, it is not part of this collection.
 | Sample | What it shows |
 |---|---|
 | [`autonomous-retail-replenishment-genie-quick-mmf`](./autonomous-retail-replenishment-genie-quick-mmf) | A closed **detect → decide → act** replenishment loop: Databricks Many Model Forecasting (MMF) serving Amazon Chronos-2 for demand forecasts, a Databricks Genie Agent for natural-language surge detection, and Amazon Quick reconciling forecasts against live supplier availability in Amazon S3 Tables to place orders or raise exception tickets. Companion code for the AWS ML Blog and AWS Partner Network (APN) blog posts. |
+| [`databricks-genie-agentcore-mcp`](./databricks-genie-agentcore-mcp) | Expose a Databricks Genie space as a governed **MCP** tool through an **Amazon Bedrock AgentCore Gateway**: Amazon Cognito handles inbound auth, an AgentCore OAuth2 credential provider handles outbound M2M auth to Databricks, and a Strands agent (local or on AgentCore Runtime) answers business questions over natural-language Genie queries. |
 
 ## Repository layout
 
