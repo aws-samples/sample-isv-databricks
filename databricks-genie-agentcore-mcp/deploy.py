@@ -79,6 +79,18 @@ def create_credential_provider(agentcore) -> tuple:
     )
     provider_arn = provider["credentialProviderArn"]
     secret_arn = provider.get("secretArn") or provider.get("clientSecretArn", {}).get("secretArn", "")
+    if not secret_arn:
+        # The response shape isn't stable, so we probe two known keys above; if
+        # both miss we get "". Fail loudly here: an empty ARN would drop the
+        # secretsmanager:GetSecretValue grant in step 4, the target would still
+        # reach READY, and every tool call would then 403 at invocation with
+        # nothing pointing at the cause.
+        raise SystemExit(
+            "Credential provider returned no secret ARN (checked 'secretArn' and "
+            "'clientSecretArn.secretArn'). The AgentCore response shape may have "
+            "changed. Cannot scope the gateway role's secret read — aborting before "
+            "the target is built."
+        )
     print(f"  Credential provider ARN: {provider_arn}")
     return provider_arn, secret_arn
 
