@@ -30,10 +30,14 @@ def main() -> None:
         raise SystemExit(f"{STATE_FILE} not found — nothing to clean up.")
 
     gateway_id = config["gateway_id"]
-    target_id = config["target_id"]
+    # deploy.py writes the state file right after the gateway is created, so a
+    # deploy that failed before registering the target leaves target_id unset.
+    # Tear the gateway down anyway; there is just no target to delete.
+    target_id = config.get("target_id")
 
     print("This will delete:")
-    print(f"  Gateway target        {target_id}")
+    if target_id:
+        print(f"  Gateway target        {target_id}")
     print(f"  Credential provider   {CREDENTIAL_PROVIDER_NAME}")
     print(f"  Gateway               {gateway_id}")
     if config.get("role_arn"):
@@ -51,12 +55,13 @@ def main() -> None:
     # doing so would let, say, an AttributeError from an older boto3 abort the drain.
     failures = []
 
-    try:
-        agentcore.delete_gateway_target(gatewayIdentifier=gateway_id, targetId=target_id)
-        print("Deleted gateway target.")
-    except Exception as exc:  # noqa: BLE001
-        print(f"Could not delete gateway target: {exc}")
-        failures.append("gateway target")
+    if target_id:
+        try:
+            agentcore.delete_gateway_target(gatewayIdentifier=gateway_id, targetId=target_id)
+            print("Deleted gateway target.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not delete gateway target: {exc}")
+            failures.append("gateway target")
 
     try:
         agentcore.delete_oauth2_credential_provider(name=CREDENTIAL_PROVIDER_NAME)

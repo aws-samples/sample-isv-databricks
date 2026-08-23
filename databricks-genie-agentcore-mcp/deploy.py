@@ -40,6 +40,13 @@ def banner(step: str) -> None:
     print("=" * 60)
 
 
+def write_state(config: dict) -> None:
+    """Persist gateway_config.json for invoke.py / genie_agent.py / cleanup.py."""
+    with open(STATE_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"  Wrote {STATE_FILE}")
+
+
 def create_gateway(setup: GatewaySetup) -> dict:
     """Create the Cognito authorizer, the IAM role and the MCP gateway."""
     print("Creating Cognito authorizer (inbound auth)...")
@@ -170,6 +177,26 @@ def deploy() -> None:
     gateway = created["gateway"]
     gateway_id = gateway["gatewayId"]
 
+    # Write the state file now, before steps 3-5 create anything a later failure
+    # could strand. The gateway, its IAM role and the Cognito pool already exist;
+    # if the credential provider (step 3), the permission grant (step 4) or the
+    # target (step 5) then fails -- including the empty-ARN guard below -- cleanup.py
+    # needs gateway_config.json to tear those three back down. target_id and
+    # provider_arn are filled in once step 5 succeeds.
+    config = {
+        "gateway_id": gateway_id,
+        "gateway_url": gateway["gatewayUrl"],
+        "target_id": None,
+        "provider_arn": None,
+        "genie_space_id": GENIE_SPACE_ID,
+        "region": AWS_REGION,
+        # Cognito inbound-auth client; mints the gateway bearer token.
+        "client_info": created["client_info"],
+        "role_arn": created["role_arn"],
+        "databricks_host": DATABRICKS_HOST,
+    }
+    write_state(config)
+
     banner("STEP 3: Create Databricks OAuth2 Credential Provider")
     provider_arn, secret_arn = create_credential_provider(agentcore)
 
@@ -180,21 +207,9 @@ def deploy() -> None:
     target_id = register_genie_target(agentcore, gateway_id, provider_arn)
 
     banner("STEP 6: Save Configuration")
-    config = {
-        "gateway_id": gateway_id,
-        "gateway_url": gateway["gatewayUrl"],
-        "target_id": target_id,
-        "provider_arn": provider_arn,
-        "genie_space_id": GENIE_SPACE_ID,
-        "region": AWS_REGION,
-        # Cognito inbound-auth client; mints the gateway bearer token.
-        "client_info": created["client_info"],
-        "role_arn": created["role_arn"],
-        "databricks_host": DATABRICKS_HOST,
-    }
-    with open(STATE_FILE, "w") as f:
-        json.dump(config, f, indent=2)
-    print(f"  Wrote {STATE_FILE}")
+    config["target_id"] = target_id
+    config["provider_arn"] = provider_arn
+    write_state(config)
 
     print()
     print("Deployment complete. Next: python invoke.py")
