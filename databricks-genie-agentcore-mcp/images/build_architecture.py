@@ -6,18 +6,22 @@ with no external assets. This script is the source used to produce it, so a
 future icon refresh or layout change is an edit here rather than a rebuild by
 hand.
 
-AWS marks come from the official AWS Architecture Icons toolkit
-(https://aws.amazon.com/architecture/icons/, 04302026 release). The toolkit
-publishes a single Amazon Bedrock AgentCore mark with no per-capability
-variants, so Runtime / Gateway / Identity each use that mark with a text
-label -- the same convention as the AgentCore workshops in this repo.
+The Amazon Bedrock, Amazon Cognito and Amazon CloudWatch marks come from the
+official AWS Architecture Icons toolkit (https://aws.amazon.com/architecture/icons/,
+04302026 release). The Amazon Bedrock AgentCore mark is a separate brand export --
+the toolkit release used here ships no AgentCore service icon -- and Runtime /
+Gateway / Identity each reuse that one mark with a text label, the same convention
+as the AgentCore workshops in this repo.
 
 Usage:
-    python build_architecture.py --icons /path/to/unpacked/asset-package
+    python build_architecture.py             # rebuild from the committed icons_b64.json cache
+    python build_architecture.py --icons /path/to/unpacked/asset-package  # refresh the cache
     rsvg-convert -w 2064 architecture.svg -o architecture.png
 
-ICON_SOURCES maps each diagram icon to its path inside the unpacked AWS
-toolkit; Databricks marks come from the Databricks brand icon set.
+The committed icons_b64.json holds every mark as a data URI, so a clean checkout
+rebuilds the SVG with no external assets. ICON_SOURCES is used only when that
+cache is absent: it maps each AWS mark to its path inside the unpacked toolkit,
+and Databricks marks to the Databricks brand icon set.
 """
 
 import argparse
@@ -26,8 +30,12 @@ import json
 import os
 
 ICON_SOURCES = {
-    # AWS Architecture Icons toolkit (Asset-Package_04302026)
+    # Amazon Bedrock AgentCore mark: a standalone brand export, not shipped in the
+    # AWS Architecture Icons toolkit release used here. The committed icons_b64.json
+    # is its source of truth; this path is a best-effort fallback for a future
+    # toolkit release that adds an AgentCore service icon.
     "agentcore": "Architecture-Service-Icons_04302026/Arch_Artificial-Intelligence/64/Arch_Amazon-Bedrock-AgentCore_64.svg",
+    # AWS Architecture Icons toolkit (Asset-Package_04302026)
     "bedrock": "Architecture-Service-Icons_04302026/Arch_Artificial-Intelligence/64/Arch_Amazon-Bedrock_64.svg",
     "cognito": "Architecture-Service-Icons_04302026/Arch_Security-Identity/64/Arch_Amazon-Cognito_64.svg",
     "cloudwatch": "Architecture-Service-Icons_04302026/Arch_Management-Tools/64/Arch_Amazon-CloudWatch_64.svg",
