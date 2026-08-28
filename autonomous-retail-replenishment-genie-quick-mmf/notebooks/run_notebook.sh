@@ -20,7 +20,7 @@
 # The notebook location is derived from (override any of these if you imported the
 # Git folder elsewhere; defaults match this solution's import step):
 #   NB_ROOT      workspace root that holds the Git folder  [default /Workspace/Users/$WORKSPACE_USER]
-#   REPO_NAME    the imported Git folder name              [default isv-databricks-samples]
+#   REPO_NAME    the imported Git folder name              [default sample-isv-databricks]
 #   REPO_SUBDIR  path within the repo to the notebooks     [default autonomous-retail-replenishment-genie-quick-mmf/notebooks]
 #
 # Usage:
@@ -58,7 +58,7 @@ esac
 
 # Notebook location — each segment overridable; defaults match the import step.
 NB_ROOT="${NB_ROOT:-/Workspace/Users/${WORKSPACE_USER}}"
-REPO_NAME="${REPO_NAME:-isv-databricks-samples}"
+REPO_NAME="${REPO_NAME:-sample-isv-databricks}"
 REPO_SUBDIR="${REPO_SUBDIR:-autonomous-retail-replenishment-genie-quick-mmf/notebooks}"
 NB_PATH="${NB_ROOT}/${REPO_NAME}/${REPO_SUBDIR}/${NB}"
 POLL_SECONDS="${POLL_SECONDS:-20}"

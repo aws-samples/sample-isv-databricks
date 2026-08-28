@@ -147,6 +147,17 @@ as console-only; substitute your `<PLACEHOLDER>` values throughout.
     ids/quantities as strings — query with `.S`, not `.N`.)
 
 ## Configuration — placeholders to replace
+
+Start by copying the environment template and filling it in; the scripts source it:
+
+```bash
+cp .supply-chain-automation-env.example .supply-chain-automation-env
+# fill in the values, then
+source .supply-chain-automation-env
+```
+
+The filled-in copy is gitignored. Values the scripts discover are saved to
+`scripts/.env.generated` and reloaded automatically.
 Every environment-specific value in the runbooks/specs is a `<PLACEHOLDER>`. Substitute your own.
 Find them all with: `grep -rn "<[A-Z_]*>" .`
 

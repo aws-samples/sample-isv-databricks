@@ -1,0 +1,44 @@
+# Environment for the autonomous retail replenishment solution.
+#
+#   cp .supply-chain-automation-env.example .supply-chain-automation-env
+#   # fill in the values below, then:
+#   source .supply-chain-automation-env
+#
+# Never commit the filled-in copy. Values discovered by the scripts are written
+# to scripts/.env.generated (gitignored) and reloaded automatically, so they are
+# deliberately absent from this template.
+
+# ---- AWS -------------------------------------------------------------------
+export AWS_PROFILE_SC=""          # your AWS CLI profile
+export ACCOUNT_ID=""              # aws sts get-caller-identity --query Account --output text
+export REGION=""                  # one Region for the whole solution; must support both S3 Tables and
+                                  # Amazon Quick action connectors, spaces and flows
+
+# ---- Databricks workspace --------------------------------------------------
+export DBX_PROFILE=""             # workspace CLI profile: databricks auth login
+export WORKSPACE_USER=""          # databricks auth describe -> the "User" line
+export WORKSPACE_HOST=""          # host without https:// e.g. dbc-xxxxxxxx.cloud.databricks.com
+export WAREHOUSE_ID=""            # optional: reuse an existing serverless SQL warehouse. Leave blank
+                                  # and the genie phase creates one and saves the id for later phases.
+
+# ---- Databricks account (account-admin; OAuth app phase only) --------------
+export DBX_ACCOUNT_PROFILE=""     # account-level CLI profile
+export DBX_ACCOUNT_ID=""          # Databricks account id
+
+# ---- Supplier feed ---------------------------------------------------------
+export S3T_BUCKET=""              # name to create for the S3 Tables supplier bucket
+
+# ---- Amazon Quick ----------------------------------------------------------
+export QUICK_ACCOUNT_NAME=""      # Quick account directory name
+export NOTIFICATION_EMAIL=""      # Quick notification email
+
+# ---- Console-only ids (collected part-way through; see README run order) ----
+# These come from console steps, so they are empty on a first run and filled in
+# before the datasource/space/flow phases.
+export DATASET_ID=""                        # aws quicksight list-data-sets
+export GENIE_MCP_CONNECTOR_ID=""            # list-action-connectors, MODEL_CONTEXT_PROTOCOL row
+export OPENAPI_ACTION_CONNECTOR_ID=""       # list-action-connectors, OPEN_API row
+export OPENAPI_SUBMIT_ORDER_ACTION_ID=""    # connector "Test action" on SubmitOrder
+export OPENAPI_CREATE_TICKET_ACTION_ID=""   # connector "Test action" on CreateTicket
+export CONSOLE_CALLER_ARN=""                # only if your console identity differs from your CLI one:
+                                            # run "aws sts get-caller-identity" in console CloudShell
