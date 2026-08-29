@@ -178,14 +178,29 @@ class ContractTest(unittest.TestCase):
 class DeployGuardTest(unittest.TestCase):
     # --- rule 3: refuse to start over a live deployment ----------------------
     def test_deploy_refuses_when_state_already_records_a_gateway(self):
-        os.environ.update(
+        # Restore env and sys.modules, or this test leaks into whatever runs after it and
+        # the suite silently becomes order-dependent.
+        env = mock.patch.dict(
+            os.environ,
             {
                 "DATABRICKS_HOST": "https://example.cloud.databricks.com",
                 "DATABRICKS_CLIENT_ID": "cid",
                 "DATABRICKS_CLIENT_SECRET": "sec",
                 "GENIE_SPACE_ID": "space",
-            }
+            },
         )
+        env.start()
+        self.addCleanup(env.stop)
+        saved = {m: sys.modules.get(m) for m in ("config", "deploy")}
+
+        def _restore():
+            for m, mod in saved.items():
+                if mod is None:
+                    sys.modules.pop(m, None)
+                else:
+                    sys.modules[m] = mod
+
+        self.addCleanup(_restore)
         for mod in ("config", "deploy"):
             sys.modules.pop(mod, None)
         import deploy  # noqa: PLC0415 - re-imported after the env is set

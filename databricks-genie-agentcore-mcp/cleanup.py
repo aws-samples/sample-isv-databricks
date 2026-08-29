@@ -39,12 +39,36 @@ import boto3
 from config import IAM_POLICY_NAME, STATE_FILE
 
 # Errors that mean "already gone", which rule 7 treats as success.
-_GONE = ("ResourceNotFoundException", "NoSuchEntity", "ResourceNotFound")
+_GONE = ("ResourceNotFoundException", "NoSuchEntityException")
 
 
 def _already_gone(exc: Exception) -> bool:
-    name = type(exc).__name__
-    return any(m in name for m in _GONE) or any(m in str(exc) for m in _GONE)
+    """True only for botocore's generated not-found exception classes.
+
+    Deliberately does NOT inspect str(exc): an AccessDenied or Validation error whose
+    message merely quotes these shapes would be reported as success, and cleanup would
+    then delete the state file while the resource kept billing.
+    """
+    return any(m in type(exc).__name__ for m in _GONE)
+
+
+def _all_targets(agentcore, gateway_id: str) -> list:
+    """Every target on the gateway, following nextToken.
+
+    An unpaginated call silently returned only the first page, so cleanup deleted page
+    one, the drain loop then reported "drained", and DeleteGateway failed on a dependency
+    that was never listed.
+    """
+    items, token = [], None
+    while True:
+        kwargs = {"gatewayIdentifier": gateway_id}
+        if token:
+            kwargs["nextToken"] = token
+        page = agentcore.list_gateway_targets(**kwargs)
+        items.extend(page.get("items", []))
+        token = page.get("nextToken")
+        if not token:
+            return items
 
 
 def _discover_target_ids(agentcore, gateway_id: str, recorded_id) -> list:
@@ -55,8 +79,7 @@ def _discover_target_ids(agentcore, gateway_id: str, recorded_id) -> list:
     deleted target forever and never converge.
     """
     try:
-        items = agentcore.list_gateway_targets(gatewayIdentifier=gateway_id).get("items", [])
-        return [t["targetId"] for t in items if t.get("targetId")]
+        return [t["targetId"] for t in _all_targets(agentcore, gateway_id) if t.get("targetId")]
     except Exception as exc:  # noqa: BLE001
         print(f"Could not list gateway targets ({exc}); falling back to the state file.")
         return [recorded_id] if recorded_id else []
@@ -128,7 +151,7 @@ def main() -> None:
         drained = False
         for _ in range(30):
             try:
-                remaining = agentcore.list_gateway_targets(gatewayIdentifier=gateway_id).get("items", [])
+                remaining = _all_targets(agentcore, gateway_id)
             except Exception as exc:  # noqa: BLE001
                 # An API error is not "drained" -- racing ahead to DeleteGateway would
                 # fail on the still-attached dependency.
@@ -168,7 +191,11 @@ def main() -> None:
                 failures.append("gateway")
 
     role_arn = config.get("role_arn") or ""
-    if role_arn:
+    # Absent in state files written before this field existed; assume ownership then, which
+    # matches the old behaviour of always deleting the role.
+    if role_arn and not config.get("owned_role", True):
+        print(f"Leaving IAM role {role_arn.split('/')[-1]} in place — this sample did not create it.")
+    elif role_arn:
         role_name = role_arn.split("/")[-1]
         iam = boto3.client("iam")
         # Separate calls on purpose. A deploy that aborted before the grant step never

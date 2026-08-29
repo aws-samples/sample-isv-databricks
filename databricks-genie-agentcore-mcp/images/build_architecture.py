@@ -28,7 +28,6 @@ import argparse
 import base64
 import json
 import os
-import sys
 
 ICON_SOURCES = {
     # Amazon Bedrock AgentCore mark: a standalone brand export, not shipped in the

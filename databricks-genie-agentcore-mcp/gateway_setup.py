@@ -68,7 +68,7 @@ class GatewaySetup:
             waited += 15
         return False
 
-    def create_cognito_authorizer(self, name: str, on_created=None) -> dict:
+    def create_cognito_authorizer(self, name: str, on_created=None, previously_owned=False) -> dict:
         """Create (or reuse) a Cognito user pool + M2M client for inbound auth.
 
         Reuses an existing pool of the same name so that re-running deploy.py does
@@ -82,10 +82,21 @@ class GatewaySetup:
         pool_name = f"{name}-pool"
         pool_id = self._find_existing_pool(pool_name)
         reused_pool = pool_id is not None
+        # Ownership must never downgrade. Deploy #1 can create the pool, record
+        # owned_pool=true, then die in the domain wait; a re-run would find its own pool,
+        # call it "reused", and cleanup would then refuse to delete a pool this sample
+        # created -- a billable orphan with no teardown path.
+        owns = previously_owned or not reused_pool
         if reused_pool:
             print(f"  Reusing existing Cognito user pool: {pool_id}")
         else:
             pool_id = self.cognito.create_user_pool(PoolName=pool_name)["UserPool"]["Id"]
+            owns = True
+            # Contract rule 1: recorded before create_user_pool_domain, which can raise on
+            # a taken prefix or a per-account domain limit and previously stranded the pool
+            # with no state file written at all.
+            if on_created is not None:
+                on_created({"user_pool_id": pool_id, "domain": None, "owned_pool": True})
 
         domain = None
         if reused_pool:
@@ -98,7 +109,7 @@ class GatewaySetup:
         # raising first left both live with nothing recorded -- the exact orphaning this
         # reuse path exists to prevent (contract rule 1).
         if on_created is not None:
-            on_created({"user_pool_id": pool_id, "domain": domain, "owned_pool": not reused_pool})
+            on_created({"user_pool_id": pool_id, "domain": domain, "owned_pool": owns})
         if not self._wait_for_domain(domain):
             raise SystemExit(
                 f"Cognito domain {domain} did not become ACTIVE. The gateway token endpoint "
@@ -137,7 +148,7 @@ class GatewaySetup:
                             UserPoolId=pool_id, ClientId=existing["ClientId"]
                         )["UserPoolClient"]
                         print(f"  Reusing existing app client: {existing['ClientId']}")
-                        return self._client_info(pool_id, domain, described, scope, not reused_pool)
+                        return self._client_info(pool_id, domain, described, scope, owns)
         client = self.cognito.create_user_pool_client(
             UserPoolId=pool_id,
             ClientName=client_name,
@@ -150,7 +161,7 @@ class GatewaySetup:
         )["UserPoolClient"]
 
         print(f"  Cognito user pool: {pool_id}")
-        return self._client_info(pool_id, domain, client, scope, not reused_pool)
+        return self._client_info(pool_id, domain, client, scope, owns)
 
     def _client_info(self, pool_id: str, domain: str, client: dict, scope: str, owned_pool: bool) -> dict:
         return {
@@ -187,7 +198,7 @@ class GatewaySetup:
 
     # --- IAM ---------------------------------------------------------------
 
-    def create_gateway_role(self, gateway_name: str) -> str:
+    def create_gateway_role(self, gateway_name: str) -> tuple:
         """Create the gateway execution role, scoped to OAuth outbound targets."""
         role_name = f"agentcore-{gateway_name}-role"
         assume_role_policy = {
@@ -212,11 +223,13 @@ class GatewaySetup:
             )
             print(f"  Created IAM role: {role_name}")
             time.sleep(10)  # let the role propagate
-            return role["Role"]["Arn"]
+            return role["Role"]["Arn"], True
         except self.iam.exceptions.EntityAlreadyExistsException:
             self.iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(assume_role_policy))
             print(f"  IAM role already exists: {role_name} (trust policy refreshed)")
-            return self.iam.get_role(RoleName=role_name)["Role"]["Arn"]
+            # Adopted, not created. Contract rule 2: cleanup must not delete it, or it
+            # would destroy another deployment's gateway execution role.
+            return self.iam.get_role(RoleName=role_name)["Role"]["Arn"], False
 
     def grant_oauth_permissions(self, role_arn: str, policy_name: str, provider_arn: str, secret_arn: str) -> None:
         """Allow the gateway role to fetch the Databricks token and its secret.

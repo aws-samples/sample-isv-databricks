@@ -42,12 +42,16 @@ def banner(step: str) -> None:
 
 def write_state(config: dict) -> None:
     """Persist gateway_config.json for invoke.py / genie_agent.py / cleanup.py."""
-    with open(STATE_FILE, "w") as f:
+    # Write-then-rename: this now runs several times per deploy, and a Ctrl-C partway
+    # through a plain write leaves a truncated file that hides a live deployment.
+    tmp = f"{STATE_FILE}.tmp"
+    with open(tmp, "w") as f:
         json.dump(config, f, indent=2)
+    os.replace(tmp, STATE_FILE)
     print(f"  Wrote {STATE_FILE}")
 
 
-def create_gateway(setup: GatewaySetup, persist) -> dict:
+def create_gateway(setup: GatewaySetup, persist, prior_state=None) -> dict:
     """Create the Cognito authorizer, the IAM role and the MCP gateway.
 
     Persists the state file after EACH resource is created. Previously all five
@@ -56,6 +60,7 @@ def create_gateway(setup: GatewaySetup, persist) -> dict:
     protocolConfiguration validation error -- exited with real resources and no
     state, and cleanup.py then refused to run at all.
     """
+    prior_state = prior_state or {}
     state = {
         "gateway_id": None,
         "gateway_url": None,
@@ -75,11 +80,14 @@ def create_gateway(setup: GatewaySetup, persist) -> dict:
         state["client_info"] = dict(partial)
         persist(state)
 
-    state["client_info"] = setup.create_cognito_authorizer(GATEWAY_NAME, on_created=_record_pool)
+    prior_owned = bool((prior_state.get("client_info") or {}).get("owned_pool"))
+    state["client_info"] = setup.create_cognito_authorizer(
+        GATEWAY_NAME, on_created=_record_pool, previously_owned=prior_owned
+    )
     persist(state)
 
     print("Creating gateway execution role...")
-    state["role_arn"] = setup.create_gateway_role(GATEWAY_NAME)
+    state["role_arn"], state["owned_role"] = setup.create_gateway_role(GATEWAY_NAME)
     persist(state)
 
     print("Creating gateway...")
@@ -126,7 +134,10 @@ def create_credential_provider(agentcore) -> tuple:
         },
     )
     provider_arn = provider["credentialProviderArn"]
-    secret_arn = provider.get("secretArn") or provider.get("clientSecretArn", {}).get("secretArn", "")
+    _client_secret = provider.get("clientSecretArn")
+    if isinstance(_client_secret, dict):
+        _client_secret = _client_secret.get("secretArn", "")
+    secret_arn = provider.get("secretArn") or _client_secret or ""
     if not secret_arn:
         # The response shape isn't stable, so we probe two known keys above; if
         # both miss we get "". Fail loudly here: an empty ARN would drop the
@@ -213,8 +224,14 @@ def deploy() -> None:
         try:
             with open(STATE_FILE) as f:
                 existing = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            existing = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            # Do NOT treat an unreadable file as "no deployment" -- a truncated write is
+            # exactly the case most likely to be hiding a live gateway.
+            raise SystemExit(
+                f"{STATE_FILE} exists but could not be read ({exc}). It may be a truncated "
+                "write hiding a live deployment. Inspect it, or move it aside if you are "
+                "certain it is stale."
+            ) from None
         if existing.get("gateway_id"):
             raise SystemExit(
                 f"{STATE_FILE} already records gateway {existing['gateway_id']}.\n"
@@ -233,7 +250,7 @@ def deploy() -> None:
     banner("STEP 2: Create AgentCore Gateway")
     # create_gateway persists after every resource, so any failure inside step 2
     # still leaves cleanup.py enough state to tear down what already exists.
-    config = create_gateway(setup, write_state)
+    config = create_gateway(setup, write_state, prior_state=existing if os.path.exists(STATE_FILE) else {})
     gateway_id = config["gateway_id"]
 
     banner("STEP 3: Create Databricks OAuth2 Credential Provider")
