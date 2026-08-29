@@ -23,15 +23,11 @@ This sample registers the [Databricks-managed Genie MCP endpoint](https://docs.d
 
 > **Auth model.** This sample uses machine-to-machine (client-credentials) auth end to end, so Genie runs as the service principal, and Unity Catalog audit attributes every query to that service principal — not to the person who asked. That is the right model for a shared, application-level integration where all callers share one permission set. It also means **this sample does not give you per-user authorization**.
 >
-> Per-user access is available on the same `mcpServer` target — via OAuth token exchange (`grantType: TOKEN_EXCHANGE`) or authorization code — but it has a Databricks-side prerequisite this sample does not set up. Databricks gates the token-exchange grant behind an **account federation policy** that trusts the token issuer presenting the user's identity (manage these with `databricks account federation-policy`; the API is account-level and needs account admin). With no policy in place, the exchange fails with `invalid_grant` and the message `Failed to process token: TOKEN_INVALID (Ensure a valid federation policy has been configured)`.
->
-> Note that the workspace OAuth metadata at `/oidc/.well-known/oauth-authorization-server` does **not** list token exchange under `grant_types_supported`, so treat that document as incomplete rather than authoritative here — probe the token endpoint if you need to know.
->
-> So if you adapt this sample for per-user authorization: configure the federation policy first, then confirm in the Unity Catalog audit logs **whose identity actually reached Unity Catalog**. Verify it rather than inferring it from the grant type — an integration that quietly falls back to the service principal still returns answers, and the attribution gap only shows up in the audit trail. See the [outbound authorization matrix](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-outbound-auth.html) for what each target type supports.
+> Per-user authorization is out of scope for this sample and is not something it has been tested with. If you adapt it for per-user identity, note that Databricks gates the OAuth token-exchange grant behind an **account federation policy** trusting the token issuer — without one, a token-exchange request against the workspace returns `invalid_grant` with `Failed to process token: TOKEN_INVALID (Ensure a valid federation policy has been configured)`. Configure that first, then confirm in the Unity Catalog audit logs **whose identity actually reached Unity Catalog** rather than inferring it from the grant type. See the [outbound authorization matrix](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-outbound-auth.html) for what each target type supports.
 
 ## Prerequisites
 
-1. AWS credentials configured (`aws configure`) with permissions to create AgentCore resources and IAM roles, plus Bedrock foundation-model access in your region (Claude, Nova, or your preferred model)
+1. AWS credentials configured (`aws configure`) with permissions to create AgentCore resources and IAM roles, plus **Bedrock access to a current model**. The default is the `global.anthropic.claude-sonnet-5` cross-region inference profile; override it with `MODEL_ID`. Confirm what your account can actually call with `aws bedrock list-inference-profiles` — Bedrock refuses models it considers legacy on accounts that have not used them recently, and that surfaces as a `ResourceNotFoundException` on your first question rather than as a model-access error.
 2. Databricks workspace on AWS with Unity Catalog enabled and at least one [Genie Space](https://docs.databricks.com/en/genie/index.html) with Trusted Assets defined
 3. Databricks service principal with an [OAuth M2M secret](https://docs.databricks.com/en/dev-tools/auth/oauth-m2m.html). The service principal needs **all three** of the following — see [Service principal permissions](#service-principal-permissions) below, as a missing grant does not surface until the first real query:
    - `CAN_RUN` on the Genie space
@@ -78,7 +74,9 @@ Symptoms of each missing grant, as returned inside the Genie message payload:
 
 ## Configuration
 
-All configuration comes from environment variables — nothing is stored in the repo:
+All configuration comes from environment variables — nothing is stored in the repo. Either
+`export` them as below, or copy `.env.example` to `.env` and fill it in; `config.py` loads
+that file if present.
 
 ```bash
 export DATABRICKS_HOST="https://dbc-xxxxxxxx-xxxx.cloud.databricks.com"
@@ -161,8 +159,10 @@ agentcore deploy
 python invoke_runtime.py
 ```
 
-`genie_agent.py` wraps the same MCP client in a `BedrockAgentCoreApp` entrypoint,
-resolving the tool surface once at cold start rather than per request.
+`genie_agent.py` wraps the same MCP client in a `BedrockAgentCoreApp` entrypoint. The
+Cognito token and the MCP session are established per invocation rather than once at cold
+start: client-credentials tokens expire while a warm container does not, so a cold-start
+token left every request after expiry failing with a 401.
 
 > **Check the region.** `agentcore configure` may default to a different region than
 > the one you created the gateway in. The deployed agent must run in the **same
@@ -171,9 +171,10 @@ resolving the tool surface once at cold start rather than per request.
 
 ### 4. Validate governance
 
-Unity Catalog audit logs attribute the SQL execution to the service principal, and
-AgentCore Runtime and Gateway emit CloudWatch traces for each tool invocation — so a
-single question can be followed from agent prompt through to the SQL that answered it.
+Unity Catalog audit logs record the SQL executed by the service principal, and AgentCore
+Runtime and Gateway emit CloudWatch traces for each tool invocation. Check both to confirm
+what actually ran and under whose identity — this is the step that tells you whether the
+governance story holds in your own workspace.
 
 ### 5. Clean up
 

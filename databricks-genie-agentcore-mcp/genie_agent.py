@@ -16,7 +16,9 @@ Requires gateway_config.json in the same directory (written by deploy.py).
 import json
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from config import AWS_REGION, MODEL_ID, STATE_FILE, SYSTEM_PROMPT
+import boto3
+
+from config import MODEL_ID, STATE_FILE, SYSTEM_PROMPT
 from gateway_setup import GatewaySetup
 from mcp.client.streamable_http import streamablehttp_client
 from strands import Agent
@@ -54,7 +56,11 @@ def invoke(payload, context):
     try:
         tools = mcp.list_tools_sync()
         agent = Agent(
-            model=BedrockModel(model_id=MODEL_ID, region_name=AWS_REGION),
+            # Resolve the region from the container's own environment, not from
+            # config.AWS_REGION -- that carries a hardcoded us-east-1 default, and no .env
+            # reaches the container, so pinning to it would silently send inference
+            # cross-region for any deployment outside us-east-1.
+            model=BedrockModel(model_id=MODEL_ID, region_name=boto3.Session().region_name),
             tools=tools,
             system_prompt=SYSTEM_PROMPT,
         )

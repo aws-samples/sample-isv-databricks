@@ -53,11 +53,14 @@ class GatewaySetup:
                     .get("DomainDescription", {})
                     .get("Status")
                 )
-            except Exception:  # noqa: BLE001
-                status = None
+            except Exception as exc:  # noqa: BLE001
+                # A missing domain or a denied DescribeUserPoolDomain is terminal.
+                # Mapping those to "pending" burned the full timeout before failing.
+                print(f"  cannot describe Cognito domain: {exc}")
+                return False
             if status == "ACTIVE":
                 return True
-            if status == "FAILED":
+            if not status or status == "FAILED":
                 return False
             if waited % 60 == 0:
                 print(f"  waiting for Cognito domain to become ACTIVE ({status or 'pending'})...")
@@ -65,7 +68,7 @@ class GatewaySetup:
             waited += 15
         return False
 
-    def create_cognito_authorizer(self, name: str) -> dict:
+    def create_cognito_authorizer(self, name: str, on_created=None) -> dict:
         """Create (or reuse) a Cognito user pool + M2M client for inbound auth.
 
         Reuses an existing pool of the same name so that re-running deploy.py does
@@ -91,11 +94,16 @@ class GatewaySetup:
         if not domain:
             domain = f"{name.lower()}-{secrets.token_hex(4)}"
             self.cognito.create_user_pool_domain(Domain=domain, UserPoolId=pool_id)
+        # Hand the caller the pool and domain before waiting. The wait can fail, and
+        # raising first left both live with nothing recorded -- the exact orphaning this
+        # reuse path exists to prevent (contract rule 1).
+        if on_created is not None:
+            on_created({"user_pool_id": pool_id, "domain": domain, "owned_pool": not reused_pool})
         if not self._wait_for_domain(domain):
             raise SystemExit(
                 f"Cognito domain {domain} did not become ACTIVE. The gateway token endpoint "
                 "lives on this domain, so deployment cannot continue. Check the domain in the "
-                "Cognito console and re-run."
+                "Cognito console, then run `python cleanup.py` before retrying."
             )
 
         # A resource server defines the scope the M2M client requests.
@@ -108,13 +116,31 @@ class GatewaySetup:
                 Name=f"{name} API",
                 Scopes=[{"ScopeName": scope_name, "ScopeDescription": "Invoke gateway"}],
             )
-        except self.cognito.exceptions.InvalidParameterException:
-            pass  # already exists on a reused pool
+        except self.cognito.exceptions.InvalidParameterException as exc:
+            # Only an already-exists collision is expected on a reused pool. Any other
+            # bad-parameter error must surface here, or it resurfaces later as a confusing
+            # "scope does not exist" failure against the app client instead.
+            if "already exists" not in str(exc).lower():
+                raise
         scope = f"{resource_server_id}/{scope_name}"
 
+        client_name = f"{name}-client"
+        if reused_pool:
+            # Creating a fresh client on every re-run leaked credentials and let the
+            # gateway's allowedClients drift away from the id recorded in the state file.
+            for page in self.cognito.get_paginator("list_user_pool_clients").paginate(
+                UserPoolId=pool_id, MaxResults=60
+            ):
+                for existing in page.get("UserPoolClients", []):
+                    if existing.get("ClientName") == client_name:
+                        described = self.cognito.describe_user_pool_client(
+                            UserPoolId=pool_id, ClientId=existing["ClientId"]
+                        )["UserPoolClient"]
+                        print(f"  Reusing existing app client: {existing['ClientId']}")
+                        return self._client_info(pool_id, domain, described, scope, not reused_pool)
         client = self.cognito.create_user_pool_client(
             UserPoolId=pool_id,
-            ClientName=f"{name}-client",
+            ClientName=client_name,
             GenerateSecret=True,
             AllowedOAuthFlows=["client_credentials"],
             AllowedOAuthScopes=[scope],
@@ -123,18 +149,24 @@ class GatewaySetup:
             ExplicitAuthFlows=["ALLOW_REFRESH_TOKEN_AUTH"],
         )["UserPoolClient"]
 
-        discovery_url = f"https://cognito-idp.{self.region}.amazonaws.com/{pool_id}/.well-known/openid-configuration"
-        client_info = {
+        print(f"  Cognito user pool: {pool_id}")
+        return self._client_info(pool_id, domain, client, scope, not reused_pool)
+
+    def _client_info(self, pool_id: str, domain: str, client: dict, scope: str, owned_pool: bool) -> dict:
+        return {
             "user_pool_id": pool_id,
             "domain": domain,
+            # Contract rule 2. False when this sample adopted a pre-existing pool by name;
+            # cleanup.py must not delete a pool it did not create.
+            "owned_pool": owned_pool,
             "client_id": client["ClientId"],
             "client_secret": client["ClientSecret"],
             "token_endpoint": f"https://{domain}.auth.{self.region}.amazoncognito.com/oauth2/token",
             "scope": scope,
-            "discovery_url": discovery_url,
+            "discovery_url": (
+                f"https://cognito-idp.{self.region}.amazonaws.com/{pool_id}/.well-known/openid-configuration"
+            ),
         }
-        print(f"  Cognito user pool: {pool_id}")
-        return client_info
 
     @staticmethod
     def get_access_token(client_info: dict) -> str:

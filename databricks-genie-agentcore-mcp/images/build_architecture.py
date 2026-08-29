@@ -51,14 +51,15 @@ ICON_SOURCES = {
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument(
     "--icons",
-    default=".",
+    default=None,
     help="Root holding the unpacked AWS toolkit and a databricks/ folder.",
 )
 parser.add_argument("--cache", default="icons_b64.json", help="Data-URI cache.")
 args = parser.parse_args()
 
-# True when the caller passed --icons, which means "refresh", not "use the cache".
-_icons_explicit = any(a == "--icons" or a.startswith("--icons=") for a in sys.argv[1:])
+# Use argparse's own signal rather than re-scanning sys.argv: a manual scan misses the
+# abbreviations argparse accepts (--icon, --ic), which silently took the cache path.
+_icons_explicit = args.icons is not None
 
 
 def load_icons() -> dict:
@@ -75,7 +76,7 @@ def load_icons() -> dict:
 
     icons = {}
     for name, rel in ICON_SOURCES.items():
-        path = os.path.join(args.icons, rel)
+        path = os.path.join(args.icons or ".", rel)
         if not os.path.exists(path):
             raise SystemExit(
                 f"Icon not found: {path}\nPass --icons pointing at the unpacked AWS Architecture Icons asset package."

@@ -13,6 +13,7 @@ Usage:
 """
 
 import json
+import os
 import time
 
 import boto3
@@ -68,7 +69,13 @@ def create_gateway(setup: GatewaySetup, persist) -> dict:
     }
 
     print("Creating Cognito authorizer (inbound auth)...")
-    state["client_info"] = setup.create_cognito_authorizer(GATEWAY_NAME)
+    def _record_pool(partial: dict) -> None:
+        # Contract rule 1: the pool and its domain are recorded the moment they exist,
+        # before the ACTIVE wait -- which can fail and previously stranded both.
+        state["client_info"] = dict(partial)
+        persist(state)
+
+    state["client_info"] = setup.create_cognito_authorizer(GATEWAY_NAME, on_created=_record_pool)
     persist(state)
 
     print("Creating gateway execution role...")
@@ -96,15 +103,11 @@ def create_credential_provider(agentcore) -> tuple:
     authorization_endpoint = f"{DATABRICKS_HOST}/oidc/v1/authorize"
 
     print("Creating Databricks OAuth2 credential provider...")
-    # The name is fixed (cleanup.py deletes by name), so a re-run after a later
-    # failure would otherwise die here on a name conflict -- while deploy.py's own
-    # step-5 error message tells the user to re-run. Replace it instead.
-    try:
-        agentcore.delete_oauth2_credential_provider(name=CREDENTIAL_PROVIDER_NAME)
-        print(f"  Replaced existing provider '{CREDENTIAL_PROVIDER_NAME}'")
-        time.sleep(5)
-    except Exception:  # noqa: BLE001
-        pass  # did not exist, which is the normal first-run case
+    # Deliberately no pre-emptive delete here. A live target holds a
+    # credentialProviderConfigurations reference to this provider, so removing it would
+    # break a working deployment before anything is recreated -- and the name is shared
+    # across deployments in an account. Surface the conflict and let cleanup.py own
+    # teardown (contract rule 6).
     provider = agentcore.create_oauth2_credential_provider(
         name=CREDENTIAL_PROVIDER_NAME,
         credentialProviderVendor="CustomOauth2",
@@ -146,7 +149,7 @@ def grant_gateway_permissions(setup: GatewaySetup, role_arn: str, provider_arn: 
     setup.grant_oauth_permissions(role_arn, IAM_POLICY_NAME, provider_arn, secret_arn)
 
 
-def register_genie_target(agentcore, gateway_id: str, provider_arn: str) -> str:
+def register_genie_target(agentcore, gateway_id: str, provider_arn: str, on_created=None) -> str:
     """Register the Databricks-managed Genie MCP server as a gateway target."""
     mcp_url = genie_mcp_url()
     print(f"Registering Genie MCP target: {mcp_url}")
@@ -172,6 +175,8 @@ def register_genie_target(agentcore, gateway_id: str, provider_arn: str) -> str:
     )
     target_id = target["targetId"]
     print(f"  Target ID: {target_id}")
+    if on_created is not None:
+        on_created(target_id)  # contract rule 1: recorded before the READY wait can fail
 
     # The API reports status in upper case (CREATING / READY / FAILED), so
     # compare case-insensitively — SynchronizeGatewayTargets rejects a target
@@ -201,6 +206,21 @@ def register_genie_target(agentcore, gateway_id: str, provider_arn: str) -> str:
 def deploy() -> None:
     require_databricks_config()
 
+    # Contract rule 3. Checked before anything is created: there is no reuse path for a
+    # gateway or a target, so a re-run cannot succeed -- and its first state write would
+    # record gateway_id=None, hiding a live gateway and target from cleanup.py.
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                existing = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+        if existing.get("gateway_id"):
+            raise SystemExit(
+                f"{STATE_FILE} already records gateway {existing['gateway_id']}.\n"
+                "Run `python cleanup.py` first, or move that file aside if you know it is stale."
+            )
+
     banner("STEP 1: Verify AWS Credentials")
     identity = boto3.client("sts").get_caller_identity()
     print(f"  Account: {identity['Account']}")
@@ -226,7 +246,11 @@ def deploy() -> None:
     grant_gateway_permissions(setup, config["role_arn"], provider_arn, secret_arn)
 
     banner("STEP 5: Register Databricks Genie MCP Target")
-    target_id = register_genie_target(agentcore, gateway_id, provider_arn)
+    def _record_target(tid: str) -> None:
+        config["target_id"] = tid
+        write_state(config)
+
+    target_id = register_genie_target(agentcore, gateway_id, provider_arn, _record_target)
 
     banner("STEP 6: Save Configuration")
     config["target_id"] = target_id

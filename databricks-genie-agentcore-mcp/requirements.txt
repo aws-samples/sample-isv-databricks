@@ -1,10 +1,11 @@
-# Pinned deliberately: strands-agents, bedrock-agentcore and mcp all move quickly,
-# and an unpinned sample breaks for readers months after it was written.
-strands-agents~=1.10
-strands-agents-tools~=0.2
-bedrock-agentcore~=0.1
-mcp~=1.16
-boto3~=1.40
-requests~=2.32
+# Floors match the versions this sample was validated against, not arbitrary minimums.
+# mcp in particular must be able to negotiate the MCP protocol version the gateway
+# declares (see MCP_PROTOCOL_VERSION in gateway_setup.py); older clients cap out below it
+# and fail the initialize handshake.
+strands-agents~=1.53
+bedrock-agentcore~=0.1.7
+mcp~=1.29
+boto3~=1.43
+requests~=2.34
 pyyaml~=6.0
-python-dotenv~=1.1
+python-dotenv~=1.2
