@@ -11,6 +11,7 @@
 *.key
 .env
 .env.*
+.supply-chain-automation-env
 secrets.json
 *_secret*
 

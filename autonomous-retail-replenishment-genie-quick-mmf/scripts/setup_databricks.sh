@@ -36,9 +36,9 @@ require_vars \
   "WORKSPACE_USER:from databricks auth describe (the User line)" \
   "WORKSPACE_HOST:workspace host, no https:// (dbc-xxxx.cloud.databricks.com)"
 
-REPO_URL="${REPO_URL:-https://github.com/aws-samples/isv-databricks-samples.git}"
+REPO_URL="${REPO_URL:-https://github.com/aws-samples/sample-isv-databricks.git}"
 NB_ROOT="${NB_ROOT:-/Workspace/Users/${WORKSPACE_USER}}"
-REPO_NAME="${REPO_NAME:-isv-databricks-samples}"
+REPO_NAME="${REPO_NAME:-sample-isv-databricks}"
 NB_SUBDIR="${NB_SUBDIR:-autonomous-retail-replenishment-genie-quick-mmf/notebooks}"
 RUN_NB="${SCRIPT_DIR}/../notebooks/run_notebook.sh"
 GENIE_ARTIFACT="${GENIE_ARTIFACT:-genie/genie_space.json}"
