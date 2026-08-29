@@ -4,9 +4,6 @@
 # and fail the initialize handshake.
 strands-agents~=1.53
 bedrock-agentcore~=0.1.7
-# Provides the `agentcore` CLI the Runtime steps in the README depend on; the
-# bedrock-agentcore package alone does not install that entry point.
-bedrock-agentcore-starter-toolkit~=0.1
 mcp~=1.29
 boto3~=1.43
 requests~=2.34

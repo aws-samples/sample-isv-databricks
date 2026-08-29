@@ -153,8 +153,24 @@ deployment problems.
 
 ### 3. Deploy to AgentCore Runtime
 
+> **The `agentcore` CLI used below is deprecated.** These commands come from
+> `bedrock-agentcore-starter-toolkit`, which is deliberately **not** in
+> `requirements.txt` — installing it prints "The Starter Toolkit CLI is no longer
+> supported" and points at `@aws/agentcore` (`npm install -g @aws/agentcore`). The
+> replacement is not a drop-in: it scaffolds a project (`app/` plus an `agentcore/`
+> directory holding `agentcore.json` and a CDK project) rather than configuring a script
+> in place, and it does not use the `.bedrock_agentcore.yaml` that `invoke_runtime.py`
+> reads. Migrating this sample to it is a separate change. If you have already deployed
+> with the starter toolkit, `agentcore import runtime` adopts an existing runtime rather
+> than rebuilding it. Install the starter toolkit explicitly if you want to follow the
+> steps below as written:
+>
+> ```bash
+> pip install bedrock-agentcore-starter-toolkit
+> ```
+
 ```bash
-agentcore configure --entrypoint genie_agent.py
+agentcore configure --entrypoint genie_agent.py   # interactive: prompts for deployment type
 agentcore deploy
 python invoke_runtime.py
 ```
