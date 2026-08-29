@@ -14,6 +14,7 @@ Requires gateway_config.json in the same directory (written by deploy.py).
 """
 
 import json
+import os
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 import boto3
@@ -27,11 +28,54 @@ from strands.tools.mcp import MCPClient
 
 app = BedrockAgentCoreApp()
 
-# STATE_FILE is anchored to this file's directory. A bare open("gateway_config.json")
-# resolves against the container's working directory instead, which crash-looped the
-# runtime at cold start with an unhandled FileNotFoundError.
-with open(STATE_FILE) as f:
-    config = json.load(f)
+_CONFIG = None
+
+_ENV_KEYS = ("GATEWAY_URL", "COGNITO_TOKEN_ENDPOINT", "COGNITO_CLIENT_ID", "COGNITO_CLIENT_SECRET", "COGNITO_SCOPE")
+
+
+def _load_config() -> dict:
+    """Resolve runtime config, preferring the environment over the state file.
+
+    The deployed agent should not depend on gateway_config.json. That file is gitignored,
+    so the build may exclude it from the image (the agent then fails at first use), and if
+    it IS included the Cognito client secret is baked into an ECR layer. Passing the five
+    values below as Runtime environment variables avoids both -- see the README.
+
+    gateway_config.json remains the local-development path, so `python invoke.py` and a
+    locally-run entrypoint keep working with no extra setup.
+
+    Loaded lazily and cached: doing this at import time turned any config problem into a
+    container that crash-loops before the entrypoint registers, with no usable error.
+    """
+    global _CONFIG
+    if _CONFIG is not None:
+        return _CONFIG
+    if os.environ.get("GATEWAY_URL"):
+        missing = [k for k in _ENV_KEYS if not os.environ.get(k)]
+        if missing:
+            raise RuntimeError(
+                "GATEWAY_URL is set, so this agent is using environment configuration, "
+                f"but these are missing: {', '.join(missing)}"
+            )
+        _CONFIG = {
+            "gateway_url": os.environ["GATEWAY_URL"],
+            "client_info": {
+                "token_endpoint": os.environ["COGNITO_TOKEN_ENDPOINT"],
+                "client_id": os.environ["COGNITO_CLIENT_ID"],
+                "client_secret": os.environ["COGNITO_CLIENT_SECRET"],
+                "scope": os.environ["COGNITO_SCOPE"],
+            },
+        }
+        return _CONFIG
+    try:
+        with open(STATE_FILE) as f:
+            _CONFIG = json.load(f)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"No configuration found. Set {', '.join(_ENV_KEYS)} on the Runtime "
+            f"(recommended for deployment), or run deploy.py locally to write {STATE_FILE}."
+        ) from None
+    return _CONFIG
 
 
 @app.entrypoint
@@ -45,6 +89,7 @@ def invoke(payload, context):
     that one token, even an MCP reconnect re-sent the stale value. Paying a little
     setup latency per call is the correct trade.
     """
+    config = _load_config()
     token = GatewaySetup.get_access_token(config["client_info"])
     mcp = MCPClient(
         lambda: streamablehttp_client(

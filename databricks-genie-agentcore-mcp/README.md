@@ -164,6 +164,16 @@ Cognito token and the MCP session are established per invocation rather than onc
 start: client-credentials tokens expire while a warm container does not, so a cold-start
 token left every request after expiry failing with a 401.
 
+> **Pass configuration as environment variables, not as a file.** `gateway_config.json`
+> is gitignored and holds the Cognito client secret. Depending on the toolkit version the
+> build may exclude it from the image — in which case the agent has no configuration — or
+> include it, which bakes a long-lived OAuth secret into an ECR layer. Neither is what you
+> want. Set these five on the Runtime instead, reading the values from `gateway_config.json`
+> on your machine: `GATEWAY_URL`, `COGNITO_TOKEN_ENDPOINT`, `COGNITO_CLIENT_ID`,
+> `COGNITO_CLIENT_SECRET`, `COGNITO_SCOPE`. For anything beyond a sample, hold the secret
+> in Secrets Manager and grant the Runtime role read access rather than passing it inline.
+> `genie_agent.py` prefers these variables and falls back to the state file for local runs.
+
 > **Check the region.** `agentcore configure` may default to a different region than
 > the one you created the gateway in. The deployed agent must run in the **same
 > region as the gateway**, otherwise it cannot reach the gateway endpoint. Verify the
