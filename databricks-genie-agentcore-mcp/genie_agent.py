@@ -16,27 +16,33 @@ Requires gateway_config.json in the same directory (written by deploy.py).
 import json
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from config import AWS_REGION, MODEL_ID, STATE_FILE, SYSTEM_PROMPT
 from gateway_setup import GatewaySetup
 from mcp.client.streamable_http import streamablehttp_client
 from strands import Agent
 from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
 
-MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
-SYSTEM_PROMPT = (
-    "You answer business questions by calling the Databricks Genie tool exposed "
-    "through the gateway. Genie returns governed, lakehouse-native SQL answers. "
-    "Be concise and present results in a readable format."
-)
-
 app = BedrockAgentCoreApp()
 
-with open("gateway_config.json") as f:
+# STATE_FILE is anchored to this file's directory. A bare open("gateway_config.json")
+# resolves against the container's working directory instead, which crash-looped the
+# runtime at cold start with an unhandled FileNotFoundError.
+with open(STATE_FILE) as f:
     config = json.load(f)
 
 
-def _get_tools():
-    """Connect to the gateway over MCP and return (client, tools)."""
+@app.entrypoint
+def invoke(payload, context):
+    """AgentCore Runtime entrypoint.
+
+    The Cognito token and the MCP session are established per invocation, not once
+    at cold start. Client-credentials tokens expire (Cognito defaults to 60 minutes)
+    while a warm container lives far longer, so a cold-start token left every request
+    after expiry failing with a 401 -- and because the transport factory closed over
+    that one token, even an MCP reconnect re-sent the stale value. Paying a little
+    setup latency per call is the correct trade.
+    """
     token = GatewaySetup.get_access_token(config["client_info"])
     mcp = MCPClient(
         lambda: streamablehttp_client(
@@ -45,24 +51,17 @@ def _get_tools():
         )
     )
     mcp.start()
-    return mcp, mcp.list_tools_sync()
-
-
-# Establish the tool surface once at cold start rather than per invocation.
-mcp_client, tools = _get_tools()
-print(f"Loaded {len(tools)} tools from gateway")
-
-
-@app.entrypoint
-def invoke(payload, context):
-    """AgentCore Runtime entrypoint."""
-    agent = Agent(
-        model=BedrockModel(model_id=MODEL_ID),
-        tools=tools,
-        system_prompt=SYSTEM_PROMPT,
-    )
-    result = agent(payload.get("prompt", ""))
-    return {"result": result.message}
+    try:
+        tools = mcp.list_tools_sync()
+        agent = Agent(
+            model=BedrockModel(model_id=MODEL_ID, region_name=AWS_REGION),
+            tools=tools,
+            system_prompt=SYSTEM_PROMPT,
+        )
+        result = agent(payload.get("prompt", ""))
+        return {"result": result.message}
+    finally:
+        mcp.stop(None, None, None)
 
 
 if __name__ == "__main__":

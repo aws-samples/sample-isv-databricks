@@ -13,7 +13,7 @@ Usage:
 import argparse
 import json
 
-from config import MODEL_ID, STATE_FILE, SYSTEM_PROMPT
+from config import AWS_REGION, MODEL_ID, STATE_FILE, SYSTEM_PROMPT
 from gateway_setup import GatewaySetup
 from mcp.client.streamable_http import streamablehttp_client
 from strands import Agent
@@ -61,7 +61,10 @@ def main() -> None:
             return
 
         agent = Agent(
-            model=BedrockModel(model_id=MODEL_ID),
+            # Without region_name, inference silently goes to the boto3 default
+            # region instead of AWS_REGION, which .env.example promises is shared
+            # with deploy.py -- and the default us.* profile is US-only.
+            model=BedrockModel(model_id=MODEL_ID, region_name=AWS_REGION),
             tools=tools,
             system_prompt=SYSTEM_PROMPT,
         )

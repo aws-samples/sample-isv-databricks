@@ -13,6 +13,17 @@ each one.
 
 import os
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # optional dependency; `export`-only workflows still work
+    load_dotenv = None
+
+if load_dotenv is not None:
+    # .env.example tells the reader to copy it to .env. Nothing loaded that file, so
+    # following the instruction produced "Missing required environment variable(s)"
+    # even with every value filled in correctly.
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
 # --- Databricks -------------------------------------------------------------
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "").rstrip("/")
 DATABRICKS_CLIENT_ID = os.environ.get("DATABRICKS_CLIENT_ID", "")

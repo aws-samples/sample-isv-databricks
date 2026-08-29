@@ -28,6 +28,7 @@ import argparse
 import base64
 import json
 import os
+import sys
 
 ICON_SOURCES = {
     # Amazon Bedrock AgentCore mark: a standalone brand export, not shipped in the
@@ -56,10 +57,19 @@ parser.add_argument(
 parser.add_argument("--cache", default="icons_b64.json", help="Data-URI cache.")
 args = parser.parse_args()
 
+# True when the caller passed --icons, which means "refresh", not "use the cache".
+_icons_explicit = any(a == "--icons" or a.startswith("--icons=") for a in sys.argv[1:])
+
 
 def load_icons() -> dict:
-    """Return {name: data-URI}, reading from source icons or a local cache."""
-    if os.path.exists(args.cache):
+    """Return {name: data-URI}, reading from source icons or a local cache.
+
+    The cache short-circuit only applies when --icons was not passed explicitly.
+    icons_b64.json is committed, so it always exists in a clean checkout, which made
+    the documented `--icons /path/to/asset-package` refresh a silent no-op: the user
+    got "wrote architecture.svg" and the old icons.
+    """
+    if os.path.exists(args.cache) and not _icons_explicit:
         with open(args.cache) as f:
             return json.load(f)
 
@@ -257,6 +267,10 @@ a(
 
 a("</svg>")
 
-with open("architecture.svg", "w") as f:
+# encoding is explicit: the SVG carries U+2014, U+00B7 and U+2019, so relying on the
+# locale default raised UnicodeEncodeError under LC_ALL=C (CI, slim containers) and
+# silently wrote non-UTF-8 bytes under a latin-1 locale. The file has no XML
+# declaration, so renderers assume UTF-8 per the XML spec.
+with open("architecture.svg", "w", encoding="utf-8") as f:
     f.write("\n".join(p))
 print("wrote architecture.svg")

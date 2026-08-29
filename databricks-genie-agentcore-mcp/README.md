@@ -21,15 +21,21 @@ This sample registers the [Databricks-managed Genie MCP endpoint](https://docs.d
 - **Outbound auth** — Databricks OAuth2 M2M credentials, registered via `CreateOauth2CredentialProvider` (scoped to `genie`) and retrieved by Gateway at tool-invocation time
 - **Audit** — Unity Catalog audit logs attribute SQL execution to the service principal; AgentCore Runtime and Gateway emit CloudWatch traces for each tool invocation
 
-> **Auth model.** This sample uses machine-to-machine (client-credentials) auth end to end, so Genie runs as the service principal — the right model for a shared, application-level integration where every caller shares one permission set. The same `mcpServer` target also supports per-user access via OAuth token exchange (`grantType: TOKEN_EXCHANGE`) or authorization code, in which case Unity Catalog enforces each end user's own permissions; see the [outbound authorization matrix](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-outbound-auth.html) for what each target type supports.
+> **Auth model.** This sample uses machine-to-machine (client-credentials) auth end to end, so Genie runs as the service principal, and Unity Catalog audit attributes every query to that service principal — not to the person who asked. That is the right model for a shared, application-level integration where all callers share one permission set. It also means **this sample does not give you per-user authorization**.
+>
+> Per-user access is available on the same `mcpServer` target — via OAuth token exchange (`grantType: TOKEN_EXCHANGE`) or authorization code — but it has a Databricks-side prerequisite this sample does not set up. Databricks gates the token-exchange grant behind an **account federation policy** that trusts the token issuer presenting the user's identity (manage these with `databricks account federation-policy`; the API is account-level and needs account admin). With no policy in place, the exchange fails with `invalid_grant` and the message `Failed to process token: TOKEN_INVALID (Ensure a valid federation policy has been configured)`.
+>
+> Note that the workspace OAuth metadata at `/oidc/.well-known/oauth-authorization-server` does **not** list token exchange under `grant_types_supported`, so treat that document as incomplete rather than authoritative here — probe the token endpoint if you need to know.
+>
+> So if you adapt this sample for per-user authorization: configure the federation policy first, then confirm in the Unity Catalog audit logs **whose identity actually reached Unity Catalog**. Verify it rather than inferring it from the grant type — an integration that quietly falls back to the service principal still returns answers, and the attribution gap only shows up in the audit trail. See the [outbound authorization matrix](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-outbound-auth.html) for what each target type supports.
 
 ## Prerequisites
 
 1. AWS credentials configured (`aws configure`) with permissions to create AgentCore resources and IAM roles, plus Bedrock foundation-model access in your region (Claude, Nova, or your preferred model)
 2. Databricks workspace on AWS with Unity Catalog enabled and at least one [Genie Space](https://docs.databricks.com/en/genie/index.html) with Trusted Assets defined
 3. Databricks service principal with an [OAuth M2M secret](https://docs.databricks.com/en/dev-tools/auth/oauth-m2m.html). The service principal needs **all three** of the following — see [Service principal permissions](#service-principal-permissions) below, as a missing grant does not surface until the first real query:
-   - `CAN RUN` on the Genie space
-   - `CAN USE` on the SQL warehouse that backs the Genie space
+   - `CAN_RUN` on the Genie space
+   - `CAN_USE` on the SQL warehouse that backs the Genie space
    - `USE CATALOG` / `USE SCHEMA` / `SELECT` on the tables behind it
 4. Python 3.10+ (`pip install -r requirements.txt`)
 
@@ -109,7 +115,12 @@ python deploy.py
 2. **Create the gateway** — creates a Cognito user pool, domain, resource server and
    machine-to-machine app client for inbound auth; creates a least-privilege gateway
    execution role; then calls `CreateGateway` with a `CUSTOM_JWT` authorizer pointed at
-   the pool's OIDC discovery URL. Waits 30s for IAM propagation.
+   the pool's OIDC discovery URL. Waits 30s for IAM propagation. An existing pool of the
+   same name is reused rather than duplicated, so a re-run does not leak one, and the
+   script blocks until the Cognito hosted-UI domain reports `ACTIVE` — that domain hosts
+   the token endpoint and its CloudFront distribution can take several minutes, so
+   continuing early produced a bare DNS failure in the next step. The state file is
+   written as each resource is created, so an interrupted run is still cleanable.
 3. **Create the Databricks credential provider** — registers the service principal's
    OAuth2 client credentials via `create_oauth2_credential_provider()`, pointing
    discovery at your workspace's `/oidc/v1/token` endpoint. This is the outbound auth
@@ -137,6 +148,10 @@ python invoke.py "Break down sales by region for the last fiscal year."
 streamable-HTTP, hands the discovered tools to a Strands `Agent`, and asks your
 question. Run this before deploying — it isolates auth and grant problems from
 deployment problems.
+
+> **First question is slow.** If the SQL warehouse behind your Genie space is stopped,
+> the first query cold-starts it and can take a couple of minutes. That is the warehouse
+> starting, not a broken integration.
 
 ### 3. Deploy to AgentCore Runtime
 

@@ -1,7 +1,10 @@
-strands-agents
-strands-agents-tools
-bedrock-agentcore
-mcp
-boto3
-requests
-pyyaml
+# Pinned deliberately: strands-agents, bedrock-agentcore and mcp all move quickly,
+# and an unpinned sample breaks for readers months after it was written.
+strands-agents~=1.10
+strands-agents-tools~=0.2
+bedrock-agentcore~=0.1
+mcp~=1.16
+boto3~=1.40
+requests~=2.32
+pyyaml~=6.0
+python-dotenv~=1.1

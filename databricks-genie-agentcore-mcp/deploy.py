@@ -5,9 +5,8 @@ Steps performed:
     2. Create the gateway with a Cognito authorizer (inbound auth)
     3. Create the Databricks OAuth2 M2M credential provider (outbound auth)
     4. Grant the gateway role permission to use that provider
-    5. Register the Databricks-managed Genie MCP endpoint as a gateway target
-    6. Wait for the target and synchronize the tool surface
-    7. Write gateway_config.json for invoke.py / genie_agent.py / cleanup.py
+    5. Register the Genie MCP endpoint as a target, wait for it, sync the tool surface
+    6. Write gateway_config.json for invoke.py / genie_agent.py / cleanup.py
 
 Usage:
     python deploy.py
@@ -47,26 +46,65 @@ def write_state(config: dict) -> None:
     print(f"  Wrote {STATE_FILE}")
 
 
-def create_gateway(setup: GatewaySetup) -> dict:
-    """Create the Cognito authorizer, the IAM role and the MCP gateway."""
+def create_gateway(setup: GatewaySetup, persist) -> dict:
+    """Create the Cognito authorizer, the IAM role and the MCP gateway.
+
+    Persists the state file after EACH resource is created. Previously all five
+    resources (pool, domain, resource server, app client, role) were built before
+    the first write, so a CreateGateway failure -- a throttle, a quota, or a
+    protocolConfiguration validation error -- exited with real resources and no
+    state, and cleanup.py then refused to run at all.
+    """
+    state = {
+        "gateway_id": None,
+        "gateway_url": None,
+        "target_id": None,
+        "provider_arn": None,
+        "genie_space_id": GENIE_SPACE_ID,
+        "region": AWS_REGION,
+        "client_info": None,
+        "role_arn": None,
+        "databricks_host": DATABRICKS_HOST,
+    }
+
     print("Creating Cognito authorizer (inbound auth)...")
-    client_info = setup.create_cognito_authorizer(GATEWAY_NAME)
+    state["client_info"] = setup.create_cognito_authorizer(GATEWAY_NAME)
+    persist(state)
 
     print("Creating gateway execution role...")
-    role_arn = setup.create_gateway_role(GATEWAY_NAME)
+    state["role_arn"] = setup.create_gateway_role(GATEWAY_NAME)
+    persist(state)
 
     print("Creating gateway...")
-    gateway = setup.create_mcp_gateway(GATEWAY_NAME, role_arn, client_info)
+    gateway = setup.create_mcp_gateway(GATEWAY_NAME, state["role_arn"], state["client_info"])
+    state["gateway_id"] = gateway["gatewayId"]
+    state["gateway_url"] = gateway["gatewayUrl"]
+    persist(state)
+
     print("  Waiting 30s for IAM propagation...")
     time.sleep(30)
-    return {"gateway": gateway, "client_info": client_info, "role_arn": role_arn}
+    return state
 
 
 def create_credential_provider(agentcore) -> tuple:
     """Register Databricks OAuth2 client-credentials as an outbound provider."""
     token_endpoint = f"{DATABRICKS_HOST}/oidc/v1/token"
+    # Databricks publishes these separately: /oidc/v1/token and /oidc/v1/authorize
+    # (confirmed via the workspace's /oidc/.well-known/oauth-authorization-server).
+    # Unused under CLIENT_CREDENTIALS, but pointing it at the token endpoint broke
+    # the authorization-code path the README points readers toward.
+    authorization_endpoint = f"{DATABRICKS_HOST}/oidc/v1/authorize"
 
     print("Creating Databricks OAuth2 credential provider...")
+    # The name is fixed (cleanup.py deletes by name), so a re-run after a later
+    # failure would otherwise die here on a name conflict -- while deploy.py's own
+    # step-5 error message tells the user to re-run. Replace it instead.
+    try:
+        agentcore.delete_oauth2_credential_provider(name=CREDENTIAL_PROVIDER_NAME)
+        print(f"  Replaced existing provider '{CREDENTIAL_PROVIDER_NAME}'")
+        time.sleep(5)
+    except Exception:  # noqa: BLE001
+        pass  # did not exist, which is the normal first-run case
     provider = agentcore.create_oauth2_credential_provider(
         name=CREDENTIAL_PROVIDER_NAME,
         credentialProviderVendor="CustomOauth2",
@@ -76,7 +114,7 @@ def create_credential_provider(agentcore) -> tuple:
                     "authorizationServerMetadata": {
                         "issuer": DATABRICKS_HOST,
                         "tokenEndpoint": token_endpoint,
-                        "authorizationEndpoint": token_endpoint,
+                        "authorizationEndpoint": authorization_endpoint,
                     }
                 },
                 "clientId": DATABRICKS_CLIENT_ID,
@@ -173,35 +211,19 @@ def deploy() -> None:
     agentcore = setup.client
 
     banner("STEP 2: Create AgentCore Gateway")
-    created = create_gateway(setup)
-    gateway = created["gateway"]
-    gateway_id = gateway["gatewayId"]
-
-    # Write the state file now, before steps 3-5 create anything a later failure
-    # could strand. The gateway, its IAM role and the Cognito pool already exist;
-    # if the credential provider (step 3), the permission grant (step 4) or the
-    # target (step 5) then fails -- including the empty-ARN guard below -- cleanup.py
-    # needs gateway_config.json to tear those three back down. target_id and
-    # provider_arn are filled in once step 5 succeeds.
-    config = {
-        "gateway_id": gateway_id,
-        "gateway_url": gateway["gatewayUrl"],
-        "target_id": None,
-        "provider_arn": None,
-        "genie_space_id": GENIE_SPACE_ID,
-        "region": AWS_REGION,
-        # Cognito inbound-auth client; mints the gateway bearer token.
-        "client_info": created["client_info"],
-        "role_arn": created["role_arn"],
-        "databricks_host": DATABRICKS_HOST,
-    }
-    write_state(config)
+    # create_gateway persists after every resource, so any failure inside step 2
+    # still leaves cleanup.py enough state to tear down what already exists.
+    config = create_gateway(setup, write_state)
+    gateway_id = config["gateway_id"]
 
     banner("STEP 3: Create Databricks OAuth2 Credential Provider")
     provider_arn, secret_arn = create_credential_provider(agentcore)
 
+    config["provider_arn"] = provider_arn
+    write_state(config)
+
     banner("STEP 4: Grant Gateway Role Permissions")
-    grant_gateway_permissions(setup, created["role_arn"], provider_arn, secret_arn)
+    grant_gateway_permissions(setup, config["role_arn"], provider_arn, secret_arn)
 
     banner("STEP 5: Register Databricks Genie MCP Target")
     target_id = register_genie_target(agentcore, gateway_id, provider_arn)

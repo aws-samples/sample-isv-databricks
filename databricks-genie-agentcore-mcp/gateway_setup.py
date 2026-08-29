@@ -28,27 +28,88 @@ class GatewaySetup:
 
     # --- inbound auth (Cognito) --------------------------------------------
 
+    def _find_existing_pool(self, pool_name: str):
+        """Return the id of an existing user pool with this name, or None."""
+        paginator = self.cognito.get_paginator("list_user_pools")
+        for page in paginator.paginate(MaxResults=60):
+            for pool in page.get("UserPools", []):
+                if pool.get("Name") == pool_name:
+                    return pool["Id"]
+        return None
+
+    def _wait_for_domain(self, domain: str, timeout: int = 900) -> bool:
+        """Block until the hosted-UI domain is ACTIVE.
+
+        CreateUserPoolDomain returns as soon as the request is accepted, but the
+        backing CloudFront distribution takes minutes. The token endpoint lives on
+        that domain, so returning early meant the very next step (minting a token)
+        failed with a bare DNS error that pointed nowhere near Cognito.
+        """
+        waited = 0
+        while waited < timeout:
+            try:
+                status = (
+                    self.cognito.describe_user_pool_domain(Domain=domain)
+                    .get("DomainDescription", {})
+                    .get("Status")
+                )
+            except Exception:  # noqa: BLE001
+                status = None
+            if status == "ACTIVE":
+                return True
+            if status == "FAILED":
+                return False
+            if waited % 60 == 0:
+                print(f"  waiting for Cognito domain to become ACTIVE ({status or 'pending'})...")
+            time.sleep(15)
+            waited += 15
+        return False
+
     def create_cognito_authorizer(self, name: str) -> dict:
-        """Create a Cognito user pool + M2M client for inbound gateway auth.
+        """Create (or reuse) a Cognito user pool + M2M client for inbound auth.
+
+        Reuses an existing pool of the same name so that re-running deploy.py does
+        not leak a fresh pool and hosted-UI domain on every retry -- deploy.py's own
+        failure message tells the user to re-run, and each retry previously stranded
+        resources that appeared in no state file.
 
         Returns the values needed to configure a CUSTOM_JWT authorizer and to
         mint access tokens for calling the gateway.
         """
-        pool = self.cognito.create_user_pool(PoolName=f"{name}-pool")
-        pool_id = pool["UserPool"]["Id"]
+        pool_name = f"{name}-pool"
+        pool_id = self._find_existing_pool(pool_name)
+        reused_pool = pool_id is not None
+        if reused_pool:
+            print(f"  Reusing existing Cognito user pool: {pool_id}")
+        else:
+            pool_id = self.cognito.create_user_pool(PoolName=pool_name)["UserPool"]["Id"]
 
-        domain = f"{name.lower()}-{secrets.token_hex(4)}"
-        self.cognito.create_user_pool_domain(Domain=domain, UserPoolId=pool_id)
+        domain = None
+        if reused_pool:
+            existing = self.cognito.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+            domain = existing.get("Domain") or None
+        if not domain:
+            domain = f"{name.lower()}-{secrets.token_hex(4)}"
+            self.cognito.create_user_pool_domain(Domain=domain, UserPoolId=pool_id)
+        if not self._wait_for_domain(domain):
+            raise SystemExit(
+                f"Cognito domain {domain} did not become ACTIVE. The gateway token endpoint "
+                "lives on this domain, so deployment cannot continue. Check the domain in the "
+                "Cognito console and re-run."
+            )
 
         # A resource server defines the scope the M2M client requests.
         scope_name = "invoke"
         resource_server_id = f"{name.lower()}-api"
-        self.cognito.create_resource_server(
-            UserPoolId=pool_id,
-            Identifier=resource_server_id,
-            Name=f"{name} API",
-            Scopes=[{"ScopeName": scope_name, "ScopeDescription": "Invoke gateway"}],
-        )
+        try:
+            self.cognito.create_resource_server(
+                UserPoolId=pool_id,
+                Identifier=resource_server_id,
+                Name=f"{name} API",
+                Scopes=[{"ScopeName": scope_name, "ScopeDescription": "Invoke gateway"}],
+            )
+        except self.cognito.exceptions.InvalidParameterException:
+            pass  # already exists on a reused pool
         scope = f"{resource_server_id}/{scope_name}"
 
         client = self.cognito.create_user_pool_client(
@@ -192,6 +253,9 @@ class GatewaySetup:
                     "discoveryUrl": client_info["discovery_url"],
                 }
             },
+            # DEBUG returns verbose gateway errors, which is what makes the grant
+            # mistakes in the README diagnosable. Lower it before production use --
+            # it surfaces internal error detail to callers.
             exceptionLevel="DEBUG",
         )
         print(f"  Gateway URL: {gateway['gatewayUrl']}")

@@ -18,6 +18,23 @@ import boto3
 from config import CREDENTIAL_PROVIDER_NAME, IAM_POLICY_NAME, STATE_FILE
 
 
+def _discover_target_ids(agentcore, gateway_id: str, recorded_id: str | None) -> list:
+    """Return the targets actually attached to the gateway.
+
+    Falls back to the id recorded in the state file only if the API call fails,
+    so a state file that never recorded a target cannot hide a real one.
+    """
+    try:
+        items = agentcore.list_gateway_targets(gatewayIdentifier=gateway_id).get("items", [])
+        found = [t["targetId"] for t in items if t.get("targetId")]
+        if recorded_id and recorded_id not in found:
+            found.append(recorded_id)
+        return found
+    except Exception as exc:  # noqa: BLE001
+        print(f"Could not list gateway targets ({exc}); falling back to the state file.")
+        return [recorded_id] if recorded_id else []
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--yes", action="store_true", help="delete without confirmation")
@@ -29,17 +46,27 @@ def main() -> None:
     except FileNotFoundError:
         raise SystemExit(f"{STATE_FILE} not found — nothing to clean up.")
 
-    gateway_id = config["gateway_id"]
-    # deploy.py writes the state file right after the gateway is created, so a
-    # deploy that failed before registering the target leaves target_id unset.
-    # Tear the gateway down anyway; there is just no target to delete.
-    target_id = config.get("target_id")
+    # May be None: deploy.py now persists the Cognito pool and IAM role before the
+    # gateway exists, so cleanup must be able to tear those down on their own.
+    gateway_id = config.get("gateway_id")
+    # Never trust the state file for the target list. deploy.py records target_id
+    # only after the target reaches READY, so its own documented failure -- the
+    # target that never gets there, e.g. a missing warehouse grant -- leaves a
+    # real target in AWS with "target_id": null on disk. Skipping the delete in
+    # that case left the gateway permanently undeletable, because DeleteGateway
+    # refuses while any target is still attached. Ask AWS what is actually there
+    # and fall back to the state file only if that call fails.
+    recorded_id = config.get("target_id")
+
+    agentcore_preview = boto3.client("bedrock-agentcore-control", region_name=config["region"])
+    target_ids = _discover_target_ids(agentcore_preview, gateway_id, recorded_id) if gateway_id else []
 
     print("This will delete:")
-    if target_id:
-        print(f"  Gateway target        {target_id}")
+    for tid in target_ids:
+        print(f"  Gateway target        {tid}")
     print(f"  Credential provider   {CREDENTIAL_PROVIDER_NAME}")
-    print(f"  Gateway               {gateway_id}")
+    if gateway_id:
+        print(f"  Gateway               {gateway_id}")
     if config.get("role_arn"):
         print(f"  IAM role              {config['role_arn'].split('/')[-1]}")
     if (config.get("client_info") or {}).get("user_pool_id"):
@@ -47,7 +74,7 @@ def main() -> None:
     if not args.yes and input("Proceed? [y/N] ").strip().lower() not in ("y", "yes"):
         raise SystemExit("Aborted.")
 
-    agentcore = boto3.client("bedrock-agentcore-control", region_name=config["region"])
+    agentcore = agentcore_preview
     # Teardown is best effort: each delete below catches broadly on purpose so that
     # one failure cannot abandon the resources after it. Failures are collected and
     # the state file is kept, so the command can be re-run to finish the job. That is
@@ -55,13 +82,34 @@ def main() -> None:
     # doing so would let, say, an AttributeError from an older boto3 abort the drain.
     failures = []
 
-    if target_id:
+    for tid in target_ids:
         try:
-            agentcore.delete_gateway_target(gatewayIdentifier=gateway_id, targetId=target_id)
-            print("Deleted gateway target.")
+            agentcore.delete_gateway_target(gatewayIdentifier=gateway_id, targetId=tid)
+            print(f"Deleted gateway target {tid}.")
         except Exception as exc:  # noqa: BLE001
-            print(f"Could not delete gateway target: {exc}")
-            failures.append("gateway target")
+            print(f"Could not delete gateway target {tid}: {exc}")
+            failures.append(f"gateway target {tid}")
+
+    # Target deletion is asynchronous, so drain BEFORE touching the credential
+    # provider: while a target still exists it holds a credentialProviderConfigurations
+    # reference to that provider, and the delete fails with a conflict.
+    print("Waiting for targets to detach...")
+    drained = not gateway_id
+    for _ in range(30):
+        try:
+            remaining = agentcore.list_gateway_targets(gatewayIdentifier=gateway_id).get("items", [])
+        except Exception as exc:  # noqa: BLE001
+            # Do not treat an API error as "drained" -- that raced ahead to
+            # DeleteGateway and failed on a dependency. Keep waiting instead.
+            print(f"  could not list targets ({exc}); retrying")
+            time.sleep(5)
+            continue
+        if not remaining:
+            drained = True
+            break
+        time.sleep(5)
+    if not drained:
+        print("  targets still attached after waiting; gateway delete may fail")
 
     try:
         agentcore.delete_oauth2_credential_provider(name=CREDENTIAL_PROVIDER_NAME)
@@ -70,24 +118,13 @@ def main() -> None:
         print(f"Could not delete credential provider: {exc}")
         failures.append("credential provider")
 
-    # Target deletion is asynchronous. DeleteGateway fails while any target is
-    # still attached, so wait for the target list to drain first.
-    print("Waiting for targets to detach...")
-    for _ in range(30):
+    if gateway_id:
         try:
-            remaining = agentcore.list_gateway_targets(gatewayIdentifier=gateway_id).get("items", [])
-        except Exception:  # noqa: BLE001
-            remaining = []
-        if not remaining:
-            break
-        time.sleep(5)
-
-    try:
-        agentcore.delete_gateway(gatewayIdentifier=gateway_id)
-        print("Deleted gateway.")
-    except Exception as exc:  # noqa: BLE001
-        print(f"Could not delete gateway: {exc}")
-        failures.append("gateway")
+            agentcore.delete_gateway(gatewayIdentifier=gateway_id)
+            print("Deleted gateway.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not delete gateway: {exc}")
+            failures.append("gateway")
 
     # The gateway execution role and the Cognito user pool are created by
     # deploy.py, so remove them here too.
@@ -95,10 +132,21 @@ def main() -> None:
     if role_arn:
         role_name = role_arn.split("/")[-1]
         iam = boto3.client("iam")
+        # Separate calls on purpose. A deploy that aborted before step 4 never
+        # attached the inline policy, so delete_role_policy raises NoSuchEntity --
+        # and sharing one try block meant delete_role never ran, orphaning the role
+        # and making every cleanup re-run fail identically forever.
         try:
             iam.delete_role_policy(RoleName=role_name, PolicyName=IAM_POLICY_NAME)
+        except iam.exceptions.NoSuchEntityException:
+            pass  # never attached, or already gone
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not delete inline policy on {role_name}: {exc}")
+        try:
             iam.delete_role(RoleName=role_name)
             print(f"Deleted IAM role {role_name}.")
+        except iam.exceptions.NoSuchEntityException:
+            print(f"IAM role {role_name} already gone.")
         except Exception as exc:  # noqa: BLE001
             print(f"Could not delete IAM role {role_name}: {exc}")
             failures.append("IAM role")
