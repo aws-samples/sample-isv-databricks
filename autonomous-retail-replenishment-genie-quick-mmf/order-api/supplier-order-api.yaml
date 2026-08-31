@@ -16,6 +16,19 @@ Parameters:
       no default: supply a strong, randomly generated value at deploy time (for example
       `openssl rand -hex 24`). Do not reuse a well-known or example value.
 
+  RequireApiKey:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether a request carrying NO x-api-key header is rejected. Default 'false' preserves the
+      documented demo path, because Amazon Quick's REST connector does not send a custom
+      x-api-key by default. Note that order-api/supplier-order-api-openapi-flows.json declares
+      `security: [{ApiKeyAuth: []}]` on both operations, so the OpenAPI contract already requires
+      the key: with the default, the deployed API is more permissive than its own spec and
+      POST /orders, /tickets and /orders/bulk accept unauthenticated writes from anyone holding
+      the URL. Set to 'true' for any deployment that outlives a short, supervised demo.
+
 Resources:
 
   # Customer-managed KMS key encrypting the API-key secret and both DynamoDB tables at rest.
@@ -128,6 +141,7 @@ Resources:
           ORDERS_TABLE: !Ref OrdersTable
           TICKETS_TABLE: !Ref TicketsTable
           API_KEY_SECRET_ARN: !Ref ApiKeySecret
+          REQUIRE_API_KEY: !Ref RequireApiKey
       Code:
         ZipFile: |
           import json, os, time, uuid, decimal
@@ -137,6 +151,7 @@ Resources:
           TICKETS = ddb.Table(os.environ["TICKETS_TABLE"])
           _sm = boto3.client("secretsmanager")
           _API_KEY = None
+          REQUIRE_API_KEY = os.environ.get("REQUIRE_API_KEY", "false").strip().lower() == "true"
 
           def _api_key():
               # fetch + cache the key from Secrets Manager (not stored as a plaintext env var)
@@ -189,13 +204,21 @@ Resources:
                       "priority": item["priority"]}
 
           def handler(event, ctx):
-              # API-key check is OPTIONAL (demo): Amazon Quick Automate's REST connector uses OAuth or
-              # "none" and does not send a custom x-api-key by default. So we only ENFORCE the key if one
-              # is present (rejecting a wrong key), but allow no-key calls through. Production should
-              # front this with OAuth (e.g. Cognito client-credentials) instead of an optional key.
+              # API-key handling is controlled by the RequireApiKey stack parameter.
+              #   RequireApiKey=false (default): a WRONG key is rejected, a MISSING key is allowed
+              #     through. This is what the documented demo relies on, because Amazon Quick's REST
+              #     connector does not send a custom x-api-key by default. It also means the endpoint
+              #     is open to unauthenticated writes, and is more permissive than the OpenAPI spec,
+              #     which declares security: [{ApiKeyAuth: []}] on both operations.
+              #   RequireApiKey=true: a missing key is rejected too, matching that spec.
+              # Either way, prefer fronting this with OAuth (e.g. Cognito client-credentials) for
+              # anything beyond a short, supervised demo.
               hdr = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
               sent = hdr.get("x-api-key")
-              if sent is not None and sent != _api_key():
+              if sent is None:
+                  if REQUIRE_API_KEY:
+                      return _resp(401, {"error": "missing x-api-key"})
+              elif sent != _api_key():
                   return _resp(401, {"error": "invalid x-api-key"})
               raw = event.get("body") or "{}"
               try:
