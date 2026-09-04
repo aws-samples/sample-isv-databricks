@@ -32,12 +32,14 @@ GENIE_SPACE_ID = os.environ.get("GENIE_SPACE_ID", "")
 
 # --- AWS --------------------------------------------------------------------
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-# A "global." cross-region inference profile, chosen deliberately over a "us." one:
-# the us.* profiles only resolve in US regions, and Bedrock refuses older models with
-# "marked by provider as Legacy and you have not been actively using the model in the
-# last 30 days" -- so a reader on a fresh account hit ResourceNotFoundException on their
-# first question, with an error that looks nothing like a Databricks problem.
-# Verify what your account can call with: aws bedrock list-inference-profiles
+# A "global." cross-region inference profile, chosen deliberately over a "us." one: the
+# us.* profiles only resolve in US regions. Note that the current Anthropic profiles carry
+# no date/version suffix -- "global.anthropic.claude-sonnet-5" is the whole id, verified
+# ACTIVE and callable in us-east-1 via get-inference-profile and a converse call.
+# Bedrock can also gate an older model line on an account that has not called it recently,
+# which surfaces as ResourceNotFoundException on the first question rather than as a
+# model-access error, so a current model is the safer default for a fresh account.
+# List what your own account can call with: aws bedrock list-inference-profiles
 MODEL_ID = os.environ.get("MODEL_ID", "global.anthropic.claude-sonnet-5")
 
 # --- Resource names ---------------------------------------------------------
