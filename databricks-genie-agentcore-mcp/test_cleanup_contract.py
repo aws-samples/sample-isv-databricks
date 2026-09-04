@@ -54,13 +54,16 @@ class FakeAgentCore:
 
 
 class FakeIam:
-    def __init__(self, policy_attached=False):
+    def __init__(self, policy_attached=False, policy_error=None):
         self.calls = []
         self._policy_attached = policy_attached
+        self._policy_error = policy_error
         self.exceptions = mock.Mock(NoSuchEntityException=_NoSuchEntityException)
 
     def delete_role_policy(self, RoleName, PolicyName):  # noqa: N803
         self.calls.append(("delete_role_policy", RoleName))
+        if self._policy_error:
+            raise self._policy_error
         if not self._policy_attached:
             raise _NoSuchEntityException("policy was never attached")
 
@@ -80,10 +83,11 @@ class FakeCognito:
 
 
 class ContractTest(unittest.TestCase):
-    def run_cleanup(self, state, targets=None, list_raises=False, policy_attached=False):
+    def run_cleanup(self, state, targets=None, list_raises=False, policy_attached=False, policy_error=None):
         """Run cleanup.main() against a stubbed AWS and return the fakes."""
         agentcore = FakeAgentCore(targets=targets, list_raises=list_raises)
-        iam, cognito = FakeIam(policy_attached=policy_attached), FakeCognito()
+        iam = FakeIam(policy_attached=policy_attached, policy_error=policy_error)
+        cognito = FakeCognito()
 
         def fake_client(service, **kwargs):
             return {"bedrock-agentcore-control": agentcore, "iam": iam, "cognito-idp": cognito}[service]
@@ -172,13 +176,21 @@ class ContractTest(unittest.TestCase):
         self.assertIn("delete_role", [c[0] for c in iam.calls])
         self.assertFalse(removed, "a fully successful run removes the state file")
 
-    def test_adopted_role_is_kept_but_this_samples_policy_is_removed(self):
-        """Rule 2 blocks deleting a role we only adopted -- but the grant this sample
-        attached must still go, or a role we do not own keeps standing read access to the
-        secret and credential provider this same cleanup just deleted."""
+    def test_a_failed_policy_delete_keeps_the_state_file(self):
+        """Rule 7: an unexpected failure must leave state on disk to re-run against.
+        Printing and moving on removed the file while the grant was still attached."""
+        _, _, _, state_kept = self.run_cleanup(
+            self.state(owned_role=True), policy_attached=True,
+            policy_error=PermissionError("iam:DeleteRolePolicy denied"))
+        self.assertTrue(state_kept, "state file was removed despite a failed policy delete")
+
+    def test_an_adopted_role_is_left_entirely_alone(self):
+        """Not even the inline policy. GATEWAY_NAME and IAM_POLICY_NAME are constants, so a
+        second deployment adopts the first one's role and shares its policy name -- deleting
+        it here strips the only OAuth/secret grant off a role a LIVE deployment is using."""
         role = "agentcore-DatabricksGenieGateway-role"
         _, iam, _, _ = self.run_cleanup(self.state(owned_role=False), policy_attached=True)
-        self.assertIn(("delete_role_policy", role), iam.calls)
+        self.assertNotIn(("delete_role_policy", role), iam.calls)
         self.assertNotIn(("delete_role", role), iam.calls)
 
     def test_no_gateway_recorded_still_tears_down_pool_and_role(self):
@@ -258,10 +270,10 @@ class RoleOwnershipTest(unittest.TestCase):
         def get_role(self, RoleName):  # noqa: N803 - boto3 casing
             return {"Role": {"Arn": f"arn:aws:iam::1:role/{RoleName}"}}
 
-    def _make_setup(self):
+    def _make_setup(self, fake_iam=None):
         import gateway_setup  # noqa: PLC0415 - imported here so the module stays light
 
-        fake_iam = self._Iam()
+        fake_iam = fake_iam or self._Iam()
 
         def fake_client(service, **kwargs):
             if service == "iam":
@@ -281,20 +293,33 @@ class RoleOwnershipTest(unittest.TestCase):
         _, owned = self._make_setup().create_gateway_role("G", previously_owned=False)
         self.assertFalse(owned, "cleanup would delete a role belonging to something else")
 
+    def test_an_adopted_roles_trust_policy_is_not_rewritten(self):
+        """The trust policy scopes aws:SourceArn to this region, but role names are global.
+        Refreshing a role we did not create locks another region's deployment out of
+        assuming it, and cleanup never restores it."""
+        iam = self._Iam()
+        iam.update_assume_role_policy = mock.Mock()
+        setup = self._make_setup(iam)
+        setup.create_gateway_role("G", previously_owned=False)
+        iam.update_assume_role_policy.assert_not_called()
+        setup.create_gateway_role("G", previously_owned=True)
+        iam.update_assume_role_policy.assert_called_once()
+
 
 class DomainWaitTest(unittest.TestCase):
-    """The domain wait must survive a blip and still be bounded.
+    """The domain wait must ride out blips, fail fast on faults, and stay bounded.
 
-    A transient DescribeUserPoolDomain error used to set status=None and fall into the
-    `if not status: return False` guard, so the first throttle aborted the deploy and sent
-    the user to tear down a domain that was seconds from ACTIVE. No test covered that path,
-    which is why the whole suite passed over it.
+    Two earlier two-way splits got this wrong in opposite directions: the first mapped a
+    transient error onto `status = None` and fell into `if not status: return False`, and the
+    replacement treated "no error code" as fatal -- which is every botocore connection reset
+    and timeout, the exact blips this wait exists to survive. Hence real exception types here.
     """
 
-    class _Boom(Exception):
-        def __init__(self, code):
-            super().__init__(code)
-            self.response = {"Error": {"Code": code}}
+    @staticmethod
+    def _client_error(code):
+        from botocore.exceptions import ClientError  # noqa: PLC0415
+
+        return ClientError({"Error": {"Code": code}}, "DescribeUserPoolDomain")
 
     def _setup(self, cognito):
         import gateway_setup  # noqa: PLC0415
@@ -309,43 +334,97 @@ class DomainWaitTest(unittest.TestCase):
         with mock.patch.object(gateway_setup.boto3, "client", side_effect=fake_client):
             return gateway_setup, gateway_setup.GatewaySetup("us-west-2")
 
-    def test_a_transient_error_is_retried_until_the_domain_is_active(self):
-        seq = [self._Boom("TooManyRequestsException"), self._Boom("InternalErrorException"),
-               {"DomainDescription": {"Status": "ACTIVE"}}]
-
-        def describe(Domain):  # noqa: N803 - boto3 casing
-            item = seq.pop(0)
-            if isinstance(item, Exception):
-                raise item
-            return item
-
-        gs, setup = self._setup(mock.Mock(describe_user_pool_domain=describe))
-        with mock.patch.object(gs.time, "sleep"):
-            self.assertTrue(setup._wait_for_domain("dom-1", timeout=900),
-                            "a throttle before ACTIVE must not abort the deploy")
-        self.assertEqual(seq, [], "the wait stopped polling instead of retrying")
-
-    def test_a_terminal_error_fails_fast(self):
-        cognito = mock.Mock(describe_user_pool_domain=mock.Mock(side_effect=self._Boom("AccessDeniedException")))
+    def _run(self, side_effect, timeout=900):
+        cognito = mock.Mock(describe_user_pool_domain=mock.Mock(side_effect=side_effect))
         gs, setup = self._setup(cognito)
         with mock.patch.object(gs.time, "sleep"):
-            self.assertFalse(setup._wait_for_domain("dom-1", timeout=900))
-        self.assertEqual(cognito.describe_user_pool_domain.call_count, 1, "a denied describe must not be retried")
+            return setup._wait_for_domain("dom-1", timeout=timeout), cognito
 
-    def test_permanent_transient_errors_still_terminate(self):
-        cognito = mock.Mock(describe_user_pool_domain=mock.Mock(side_effect=self._Boom("TooManyRequestsException")))
-        gs, setup = self._setup(cognito)
-        with mock.patch.object(gs.time, "sleep"):
-            self.assertFalse(setup._wait_for_domain("dom-1", timeout=60))
-        self.assertLessEqual(cognito.describe_user_pool_domain.call_count, 5, "retry loop is not bounded by timeout")
+    def test_a_service_throttle_is_retried_until_active(self):
+        ok, cognito = self._run([self._client_error("TooManyRequestsException"),
+                                 {"DomainDescription": {"Status": "ACTIVE"}}])
+        self.assertTrue(ok, "a throttle before ACTIVE must not abort the deploy")
+        self.assertEqual(cognito.describe_user_pool_domain.call_count, 2)
 
-    def test_a_non_service_error_is_not_retried(self):
-        """A fault in this call path is not a throttle. Retrying it burned the full
-        15-minute window and then reported a timeout instead of the actual error."""
-        cognito = mock.Mock(describe_user_pool_domain=mock.Mock(side_effect=TypeError("bad response shape")))
-        gs, setup = self._setup(cognito)
-        with mock.patch.object(gs.time, "sleep"):
-            self.assertFalse(setup._wait_for_domain("dom-1", timeout=900))
+    def test_a_network_fault_is_retried_until_active(self):
+        from botocore.exceptions import ConnectTimeoutError  # noqa: PLC0415
+
+        ok, cognito = self._run([ConnectTimeoutError(endpoint_url="https://cognito-idp"),
+                                 {"DomainDescription": {"Status": "ACTIVE"}}])
+        self.assertTrue(ok, "a connection timeout carries no error code and must still retry")
+        self.assertEqual(cognito.describe_user_pool_domain.call_count, 2)
+
+    def test_a_terminal_service_error_fails_fast(self):
+        ok, cognito = self._run(self._client_error("AccessDeniedException"))
+        self.assertFalse(ok)
+        self.assertEqual(cognito.describe_user_pool_domain.call_count, 1, "a denied describe must not retry")
+
+    def test_a_fault_in_the_call_path_is_not_retried(self):
+        ok, cognito = self._run(TypeError("bad response shape"))
+        self.assertFalse(ok)
         self.assertEqual(cognito.describe_user_pool_domain.call_count, 1,
                          "a programming error must fail fast, not retry for the whole timeout")
 
+    def test_missing_credentials_is_not_retried(self):
+        from botocore.exceptions import NoCredentialsError  # noqa: PLC0415
+
+        ok, cognito = self._run(NoCredentialsError())
+        self.assertFalse(ok, "BotoCoreError, but not a network fault -- retrying just burns the window")
+        self.assertEqual(cognito.describe_user_pool_domain.call_count, 1)
+
+    def test_permanent_throttling_still_terminates(self):
+        ok, cognito = self._run(self._client_error("TooManyRequestsException"), timeout=60)
+        self.assertFalse(ok)
+        self.assertLessEqual(cognito.describe_user_pool_domain.call_count, 5, "retry loop is not bounded")
+
+
+class InitialStateTest(unittest.TestCase):
+    """A re-run's first persist must not erase what the previous attempt recorded."""
+
+    def _initial_state(self, prior):
+        import deploy  # noqa: PLC0415
+
+        return deploy._initial_state(prior)
+
+    def test_a_prior_role_is_carried_forward(self):
+        s = self._initial_state({"role_arn": "arn:aws:iam::1:role/r", "owned_role": True,
+                                 "client_info": {"user_pool_id": "pool-1", "owned_pool": True}})
+        self.assertEqual(s["role_arn"], "arn:aws:iam::1:role/r")
+        self.assertTrue(s["owned_role"], "ownership must survive the first write of a re-run")
+        self.assertEqual(s["client_info"]["user_pool_id"], "pool-1")
+
+    def test_a_first_run_starts_empty(self):
+        s = self._initial_state(None)
+        self.assertIsNone(s["role_arn"])
+        self.assertIsNone(s["client_info"])
+        self.assertIsNone(s["gateway_id"])
+
+
+class ArnGuardTest(unittest.TestCase):
+    """main() reads the region out of field 3, so a malformed ARN must fail readably."""
+
+    def _resolve(self, arn):
+        import invoke_runtime  # noqa: PLC0415
+
+        cfg = {"default_agent": "a", "agents": {"a": {"bedrock_agentcore": {"agent_arn": arn}}}}
+        with tempfile.TemporaryDirectory() as d:
+            cwd = os.getcwd()
+            try:
+                os.chdir(d)
+                with open(".bedrock_agentcore.yaml", "w") as f:
+                    f.write(json.dumps(cfg))  # valid YAML
+                return invoke_runtime.resolve_agent_arn()
+            finally:
+                os.chdir(cwd)
+
+    def test_a_full_arn_is_accepted(self):
+        arn = "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/x"
+        self.assertEqual(self._resolve(arn), arn)
+
+    def test_an_empty_region_field_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._resolve("arn:aws:bedrock-agentcore::123456789012:runtime/x")
+
+    def test_a_bare_id_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._resolve("my-agent")

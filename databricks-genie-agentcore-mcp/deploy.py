@@ -40,6 +40,33 @@ def banner(step: str) -> None:
     print("=" * 60)
 
 
+def _initial_state(prior_state: dict | None) -> dict:
+    """Build the state dict for this run, carrying forward what already exists.
+
+    Starting every field at None meant the first persist of a re-run erased the resources
+    the previous attempt had recorded. A deploy that created the role and then died before
+    the gateway left role_arn=null on disk, so cleanup skipped IAM entirely and orphaned
+    the role -- and the next run read no owned_role and reported it adopted, defeating the
+    ownership guard by a different route.
+    """
+    prior_state = prior_state or {}
+    state = {
+        "gateway_id": None,
+        "gateway_url": None,
+        "target_id": None,
+        "provider_arn": None,
+        "genie_space_id": GENIE_SPACE_ID,
+        "region": AWS_REGION,
+        "client_info": None,
+        "role_arn": None,
+        "databricks_host": DATABRICKS_HOST,
+    }
+    for key in ("client_info", "role_arn", "owned_role", "provider_arn", "target_id"):
+        if prior_state.get(key) is not None:
+            state[key] = prior_state[key]
+    return state
+
+
 def write_state(config: dict) -> None:
     """Persist gateway_config.json for invoke.py / genie_agent.py / cleanup.py."""
     # Write-then-rename: this now runs several times per deploy, and a Ctrl-C partway
@@ -60,18 +87,7 @@ def create_gateway(setup: GatewaySetup, persist, prior_state=None) -> dict:
     protocolConfiguration validation error -- exited with real resources and no
     state, and cleanup.py then refused to run at all.
     """
-    prior_state = prior_state or {}
-    state = {
-        "gateway_id": None,
-        "gateway_url": None,
-        "target_id": None,
-        "provider_arn": None,
-        "genie_space_id": GENIE_SPACE_ID,
-        "region": AWS_REGION,
-        "client_info": None,
-        "role_arn": None,
-        "databricks_host": DATABRICKS_HOST,
-    }
+    state = _initial_state(prior_state)
 
     print("Creating Cognito authorizer (inbound auth)...")
     def _record_pool(partial: dict) -> None:

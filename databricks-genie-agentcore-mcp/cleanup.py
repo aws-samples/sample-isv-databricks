@@ -195,19 +195,14 @@ def main() -> None:
     # matches the old behaviour of always deleting the role.
     if role_arn and not config.get("owned_role", True):
         role_name = role_arn.split("/")[-1]
-        # Rule 2 protects the role from deletion, but this sample still attached its own
-        # inline policy to it (grant_oauth_permissions). Leaving that behind would hand a
-        # role we do not own a standing grant on a secret and credential provider this
-        # cleanup is about to delete, so remove what we added and leave the role itself.
-        iam = boto3.client("iam")
-        try:
-            iam.delete_role_policy(RoleName=role_name, PolicyName=IAM_POLICY_NAME)
-            print(f"Removed this sample's inline policy from adopted IAM role {role_name}.")
-        except iam.exceptions.NoSuchEntityException:
-            pass  # never attached, or already gone
-        except Exception as exc:  # noqa: BLE001
-            print(f"Could not remove inline policy from {role_name}: {exc}")
-        print(f"Leaving IAM role {role_name} in place — this sample did not create it.")
+        # An adopted role is left EXACTLY as found -- the inline policy too. GATEWAY_NAME
+        # and IAM_POLICY_NAME are constants, so a second deployment in this account adopts
+        # the first one's role and shares its policy name: deleting the policy here would
+        # strip the only GetResourceOauth2Token and secretsmanager grant off a role a LIVE
+        # deployment is still using. A stale grant left behind is recoverable; that outage
+        # is not. It points at a provider and secret this cleanup deletes, so it grants
+        # nothing once those are gone.
+        print(f"Leaving IAM role {role_name} and its inline policy in place — this sample did not create it.")
     elif role_arn:
         role_name = role_arn.split("/")[-1]
         iam = boto3.client("iam")
@@ -220,7 +215,10 @@ def main() -> None:
         except iam.exceptions.NoSuchEntityException:
             pass  # never attached, or already gone
         except Exception as exc:  # noqa: BLE001
+            # Tracked, or the state file is removed below while the grant survives and
+            # there is nothing left to re-run cleanup against.
             print(f"Could not delete inline policy on {role_name}: {exc}")
+            failures.append("IAM inline policy")
         try:
             iam.delete_role(RoleName=role_name)
             print(f"Deleted IAM role {role_name}.")

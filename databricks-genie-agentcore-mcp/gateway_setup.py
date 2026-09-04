@@ -10,9 +10,16 @@ import secrets
 import time
 
 import boto3
+import botocore.exceptions
 import requests
 
 MCP_PROTOCOL_VERSION = "2025-11-25"
+
+# Botocore raises these for a reset, a timeout or an unreachable endpoint. They carry no
+# error code at all, so a code-only check silently classified them as fatal -- the exact
+# blips this wait must ride out. NoCredentialsError and ParamValidationError are also
+# BotoCoreError but are NOT here: retrying them just burns the timeout.
+_RETRYABLE_NETWORK_ERRORS = (botocore.exceptions.ConnectionError, botocore.exceptions.HTTPClientError)
 
 # Errors that mean the domain will never appear, as opposed to a blip during the wait.
 _TERMINAL_DOMAIN_ERRORS = frozenset(
@@ -64,26 +71,25 @@ class GatewaySetup:
                     .get("Status")
                 )
             except Exception as exc:  # noqa: BLE001
-                code = ""
-                if hasattr(exc, "response"):
-                    code = (getattr(exc, "response", None) or {}).get("Error", {}).get("Code", "")
-                # A missing domain or a denied DescribeUserPoolDomain is terminal; mapping
-                # those to "pending" burned the full timeout before failing. Everything
-                # else -- throttling, a reset connection, a transient 5xx -- is retried,
-                # because this wait legitimately runs for minutes and a single blip used
-                # to abort the deploy and send the user to tear down a healthy domain.
-                # No service error code means this is not a throttle -- it is a fault in
-                # this call path (an AttributeError on an unexpected response shape, say).
-                # Retrying that burns the entire timeout window and then reports a timeout
-                # instead of the real error, so only genuine service errors are retried.
-                if not code or code in _TERMINAL_DOMAIN_ERRORS:
-                    print(f"  cannot describe Cognito domain: {exc}")
+                # Three cases, because two-way splits got this wrong twice. A service error
+                # is judged on its code (a missing domain or a denied describe will never
+                # succeed). A network fault carries no code at all and is always transient.
+                # Anything else is a fault in this call path, not a cloud blip, and retrying
+                # it burns the whole window and then reports a timeout instead of the error.
+                if isinstance(exc, botocore.exceptions.ClientError):
+                    detail = (exc.response or {}).get("Error", {}).get("Code", "") or "ClientError"
+                    fatal = detail in _TERMINAL_DOMAIN_ERRORS
+                elif isinstance(exc, _RETRYABLE_NETWORK_ERRORS):
+                    detail, fatal = type(exc).__name__, False
+                else:
+                    detail, fatal = type(exc).__name__, True
+                if fatal:
+                    print(f"  cannot describe Cognito domain ({detail}): {exc}")
                     return False
-                # Genuinely retry: sleep, advance the ceiling, and re-poll. Falling
-                # through to the guards below with status=None would hit `not status`
-                # and return False -- aborting the deploy on the first blip, the very
-                # thing this branch exists to prevent.
-                print(f"  transient error describing Cognito domain, retrying: {exc}")
+                # Sleep, advance the ceiling, and re-poll. Falling through to the guards
+                # below with status=None would hit `not status` and return False, aborting
+                # on the first blip -- the very thing this branch exists to prevent.
+                print(f"  transient error describing Cognito domain ({detail}), retrying: {exc}")
                 time.sleep(15)
                 waited += 15
                 continue
@@ -259,8 +265,16 @@ class GatewaySetup:
             time.sleep(10)  # let the role propagate
             return role["Role"]["Arn"], True
         except self.iam.exceptions.EntityAlreadyExistsException:
-            self.iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(assume_role_policy))
-            print(f"  IAM role already exists: {role_name} (trust policy refreshed)")
+            if previously_owned:
+                # Ours from an earlier run, so refreshing the trust policy is safe.
+                self.iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(assume_role_policy))
+                print(f"  IAM role already exists: {role_name} (ours, trust policy refreshed)")
+            else:
+                # Role names are global, but this trust policy scopes aws:SourceArn to
+                # self.region. Refreshing a role this sample did not create would lock
+                # another region's deployment out of assuming it, and cleanup never
+                # restores it, so an adopted role is left exactly as found.
+                print(f"  IAM role already exists: {role_name} (adopted, trust policy left alone)")
             # Ownership must never downgrade, for the same reason as the pool above:
             # deploy #1 can create the role, record owned_role=true, then fail before the
             # gateway exists. gateway_id is still null, so rule 3 permits a re-run, and

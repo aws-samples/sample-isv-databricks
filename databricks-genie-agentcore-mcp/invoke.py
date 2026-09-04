@@ -61,12 +61,12 @@ def main() -> None:
             return
 
         agent = Agent(
-            # No region_name, matching genie_agent.py. strands already resolves
-            # region_name or session.region_name or AWS_REGION or its own default, so
-            # passing config.AWS_REGION would make its hardcoded us-east-1 authoritative
-            # here while the deployed agent uses the container's region -- local
-            # validation and production would then call Bedrock in different regions.
-            model=BedrockModel(model_id=MODEL_ID),
+            # The region recorded in the state file, which is where deploy.py actually put
+            # the gateway. Omitting it entirely let strands fall back to its own default
+            # whenever AWS_REGION was unset, so local validation could hit a different
+            # region than the deployment it is validating; passing config.AWS_REGION instead
+            # would make its hardcoded us-east-1 authoritative even for a gateway elsewhere.
+            model=BedrockModel(model_id=MODEL_ID, region_name=config["region"]),
             tools=tools,
             system_prompt=SYSTEM_PROMPT,
         )

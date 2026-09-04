@@ -29,6 +29,11 @@ import base64
 import json
 import os
 
+# The only entry the AWS toolkit release does not ship. A refresh may fall back to the
+# committed export for THIS key alone -- falling back for any missing icon turned
+# `--icons /wrong/path` into a silent success that rewrote the cache with itself.
+OPTIONAL_ICONS = {"agentcore"}
+
 ICON_SOURCES = {
     # Amazon Bedrock AgentCore mark: a standalone brand export, not shipped in the
     # AWS Architecture Icons toolkit release used here. The committed icons_b64.json
@@ -71,20 +76,25 @@ def load_icons() -> dict:
     """
     cached = {}
     if os.path.exists(args.cache):
-        with open(args.cache) as f:
-            cached = json.load(f)
-        if not _icons_explicit:
+        try:
+            with open(args.cache) as f:
+                cached = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            # A truncated or hand-edited cache must not break the documented refresh path,
+            # which is exactly the command someone runs to rebuild it.
+            print(f"  ignoring unreadable {args.cache}: {exc}")
+            cached = {}
+        if cached and not _icons_explicit:
             return cached
 
     icons = {}
     for name, rel in ICON_SOURCES.items():
         path = os.path.join(args.icons or ".", rel)
         if not os.path.exists(path):
-            # The AgentCore mark is not shipped in the toolkit release this file targets
-            # (see ICON_SOURCES), so aborting here made the documented
-            # `--icons /path/to/asset-package` refresh fail every time. Fall back to the
-            # committed export for any icon this release does not carry.
-            if name in cached:
+            # Only OPTIONAL_ICONS may fall back, and only when the cache actually has it.
+            # Anything else missing means the --icons root is wrong, and the run must fail
+            # rather than quietly rewrite the cache with its own contents.
+            if name in OPTIONAL_ICONS and name in cached:
                 print(f"  {name}: not in this toolkit release, keeping the committed icon")
                 icons[name] = cached[name]
                 continue
