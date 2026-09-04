@@ -75,8 +75,14 @@ class GatewaySetup:
                 if code in _TERMINAL_DOMAIN_ERRORS:
                     print(f"  cannot describe Cognito domain: {exc}")
                     return False
+                # Genuinely retry: sleep, advance the ceiling, and re-poll. Falling
+                # through to the guards below with status=None would hit `not status`
+                # and return False -- aborting the deploy on the first blip, the very
+                # thing this branch exists to prevent.
                 print(f"  transient error describing Cognito domain, retrying: {exc}")
-                status = None
+                time.sleep(15)
+                waited += 15
+                continue
             if status == "ACTIVE":
                 return True
             if not status or status == "FAILED":
