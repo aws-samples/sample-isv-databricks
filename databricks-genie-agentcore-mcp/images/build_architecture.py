@@ -69,14 +69,25 @@ def load_icons() -> dict:
     the documented `--icons /path/to/asset-package` refresh a silent no-op: the user
     got "wrote architecture.svg" and the old icons.
     """
-    if os.path.exists(args.cache) and not _icons_explicit:
+    cached = {}
+    if os.path.exists(args.cache):
         with open(args.cache) as f:
-            return json.load(f)
+            cached = json.load(f)
+        if not _icons_explicit:
+            return cached
 
     icons = {}
     for name, rel in ICON_SOURCES.items():
         path = os.path.join(args.icons or ".", rel)
         if not os.path.exists(path):
+            # The AgentCore mark is not shipped in the toolkit release this file targets
+            # (see ICON_SOURCES), so aborting here made the documented
+            # `--icons /path/to/asset-package` refresh fail every time. Fall back to the
+            # committed export for any icon this release does not carry.
+            if name in cached:
+                print(f"  {name}: not in this toolkit release, keeping the committed icon")
+                icons[name] = cached[name]
+                continue
             raise SystemExit(
                 f"Icon not found: {path}\nPass --icons pointing at the unpacked AWS Architecture Icons asset package."
             )

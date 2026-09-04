@@ -194,7 +194,20 @@ def main() -> None:
     # Absent in state files written before this field existed; assume ownership then, which
     # matches the old behaviour of always deleting the role.
     if role_arn and not config.get("owned_role", True):
-        print(f"Leaving IAM role {role_arn.split('/')[-1]} in place — this sample did not create it.")
+        role_name = role_arn.split("/")[-1]
+        # Rule 2 protects the role from deletion, but this sample still attached its own
+        # inline policy to it (grant_oauth_permissions). Leaving that behind would hand a
+        # role we do not own a standing grant on a secret and credential provider this
+        # cleanup is about to delete, so remove what we added and leave the role itself.
+        iam = boto3.client("iam")
+        try:
+            iam.delete_role_policy(RoleName=role_name, PolicyName=IAM_POLICY_NAME)
+            print(f"Removed this sample's inline policy from adopted IAM role {role_name}.")
+        except iam.exceptions.NoSuchEntityException:
+            pass  # never attached, or already gone
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not remove inline policy from {role_name}: {exc}")
+        print(f"Leaving IAM role {role_name} in place — this sample did not create it.")
     elif role_arn:
         role_name = role_arn.split("/")[-1]
         iam = boto3.client("iam")

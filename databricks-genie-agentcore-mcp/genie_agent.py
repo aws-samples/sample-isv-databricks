@@ -10,7 +10,9 @@ Deployed with the AgentCore CLI, not run directly:
     agentcore configure --entrypoint genie_agent.py
     agentcore deploy
 
-Requires gateway_config.json in the same directory (written by deploy.py).
+Configuration comes from the environment -- GATEWAY_URL, COGNITO_TOKEN_ENDPOINT,
+COGNITO_CLIENT_ID, COGNITO_CLIENT_SECRET, COGNITO_SCOPE -- falling back to
+gateway_config.json (written by deploy.py) for local runs only. See _load_config.
 """
 
 import json

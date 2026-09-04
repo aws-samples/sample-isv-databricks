@@ -46,6 +46,10 @@ def resolve_agent_arn() -> str:
 
     if not agent_arn:
         raise SystemExit("Agent ARN not found — run `agentcore deploy` first.")
+    # main() reads the region out of field 3 of this ARN, so a truncated or hand-edited
+    # value has to fail here with something actionable rather than as an IndexError.
+    if not agent_arn.startswith("arn:") or len(agent_arn.split(":")) < 6:
+        raise SystemExit(f"agent_arn in .bedrock_agentcore.yaml is not a full ARN: {agent_arn!r}")
     return agent_arn
 
 

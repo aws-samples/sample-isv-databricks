@@ -14,6 +14,16 @@ import requests
 
 MCP_PROTOCOL_VERSION = "2025-11-25"
 
+# Errors that mean the domain will never appear, as opposed to a blip during the wait.
+_TERMINAL_DOMAIN_ERRORS = frozenset(
+    {
+        "ResourceNotFoundException",
+        "AccessDeniedException",
+        "NotAuthorizedException",
+        "InvalidParameterException",
+    }
+)
+
 
 class GatewaySetup:
     """Thin wrapper around the bedrock-agentcore-control boto3 client."""
@@ -54,10 +64,19 @@ class GatewaySetup:
                     .get("Status")
                 )
             except Exception as exc:  # noqa: BLE001
-                # A missing domain or a denied DescribeUserPoolDomain is terminal.
-                # Mapping those to "pending" burned the full timeout before failing.
-                print(f"  cannot describe Cognito domain: {exc}")
-                return False
+                code = ""
+                if hasattr(exc, "response"):
+                    code = (getattr(exc, "response", None) or {}).get("Error", {}).get("Code", "")
+                # A missing domain or a denied DescribeUserPoolDomain is terminal; mapping
+                # those to "pending" burned the full timeout before failing. Everything
+                # else -- throttling, a reset connection, a transient 5xx -- is retried,
+                # because this wait legitimately runs for minutes and a single blip used
+                # to abort the deploy and send the user to tear down a healthy domain.
+                if code in _TERMINAL_DOMAIN_ERRORS:
+                    print(f"  cannot describe Cognito domain: {exc}")
+                    return False
+                print(f"  transient error describing Cognito domain, retrying: {exc}")
+                status = None
             if status == "ACTIVE":
                 return True
             if not status or status == "FAILED":
@@ -198,7 +217,7 @@ class GatewaySetup:
 
     # --- IAM ---------------------------------------------------------------
 
-    def create_gateway_role(self, gateway_name: str) -> tuple:
+    def create_gateway_role(self, gateway_name: str, on_created=None, previously_owned=False) -> tuple:
         """Create the gateway execution role, scoped to OAuth outbound targets."""
         role_name = f"agentcore-{gateway_name}-role"
         assume_role_policy = {
@@ -222,14 +241,22 @@ class GatewaySetup:
                 AssumeRolePolicyDocument=json.dumps(assume_role_policy),
             )
             print(f"  Created IAM role: {role_name}")
+            # Contract rule 1: recorded before the propagation sleep below. A Ctrl-C in
+            # that 10s window otherwise left a real role with nothing in the state file
+            # and so no teardown path -- the same gap the pool callback closes.
+            if on_created is not None:
+                on_created(role["Role"]["Arn"], True)
             time.sleep(10)  # let the role propagate
             return role["Role"]["Arn"], True
         except self.iam.exceptions.EntityAlreadyExistsException:
             self.iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(assume_role_policy))
             print(f"  IAM role already exists: {role_name} (trust policy refreshed)")
-            # Adopted, not created. Contract rule 2: cleanup must not delete it, or it
-            # would destroy another deployment's gateway execution role.
-            return self.iam.get_role(RoleName=role_name)["Role"]["Arn"], False
+            # Ownership must never downgrade, for the same reason as the pool above:
+            # deploy #1 can create the role, record owned_role=true, then fail before the
+            # gateway exists. gateway_id is still null, so rule 3 permits a re-run, and
+            # that re-run finds its OWN role. Calling it adopted would make cleanup print
+            # "this sample did not create it" forever, leaving the role permanently.
+            return self.iam.get_role(RoleName=role_name)["Role"]["Arn"], previously_owned
 
     def grant_oauth_permissions(self, role_arn: str, policy_name: str, provider_arn: str, secret_arn: str) -> None:
         """Allow the gateway role to fetch the Databricks token and its secret.

@@ -87,7 +87,17 @@ def create_gateway(setup: GatewaySetup, persist, prior_state=None) -> dict:
     persist(state)
 
     print("Creating gateway execution role...")
-    state["role_arn"], state["owned_role"] = setup.create_gateway_role(GATEWAY_NAME)
+
+    def _record_role(role_arn: str, owned: bool) -> None:
+        # Contract rule 1, same reason as _record_pool: the role is recorded the moment
+        # CreateRole returns, before the 10s propagation sleep inside create_gateway_role.
+        state["role_arn"], state["owned_role"] = role_arn, owned
+        persist(state)
+
+    prior_owned_role = bool(prior_state.get("owned_role"))
+    state["role_arn"], state["owned_role"] = setup.create_gateway_role(
+        GATEWAY_NAME, on_created=_record_role, previously_owned=prior_owned_role
+    )
     persist(state)
 
     print("Creating gateway...")

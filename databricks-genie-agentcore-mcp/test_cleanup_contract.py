@@ -25,6 +25,10 @@ class _ResourceNotFoundException(Exception):
     pass
 
 
+class _EntityAlreadyExistsException(Exception):
+    pass
+
+
 class FakeAgentCore:
     def __init__(self, targets=None, list_raises=False):
         self._targets = list(targets or [])
@@ -50,13 +54,15 @@ class FakeAgentCore:
 
 
 class FakeIam:
-    def __init__(self):
+    def __init__(self, policy_attached=False):
         self.calls = []
+        self._policy_attached = policy_attached
         self.exceptions = mock.Mock(NoSuchEntityException=_NoSuchEntityException)
 
     def delete_role_policy(self, RoleName, PolicyName):  # noqa: N803
         self.calls.append(("delete_role_policy", RoleName))
-        raise _NoSuchEntityException("policy was never attached")
+        if not self._policy_attached:
+            raise _NoSuchEntityException("policy was never attached")
 
     def delete_role(self, RoleName):  # noqa: N803
         self.calls.append(("delete_role", RoleName))
@@ -74,10 +80,10 @@ class FakeCognito:
 
 
 class ContractTest(unittest.TestCase):
-    def run_cleanup(self, state, targets=None, list_raises=False):
+    def run_cleanup(self, state, targets=None, list_raises=False, policy_attached=False):
         """Run cleanup.main() against a stubbed AWS and return the fakes."""
         agentcore = FakeAgentCore(targets=targets, list_raises=list_raises)
-        iam, cognito = FakeIam(), FakeCognito()
+        iam, cognito = FakeIam(policy_attached=policy_attached), FakeCognito()
 
         def fake_client(service, **kwargs):
             return {"bedrock-agentcore-control": agentcore, "iam": iam, "cognito-idp": cognito}[service]
@@ -166,6 +172,15 @@ class ContractTest(unittest.TestCase):
         self.assertIn("delete_role", [c[0] for c in iam.calls])
         self.assertFalse(removed, "a fully successful run removes the state file")
 
+    def test_adopted_role_is_kept_but_this_samples_policy_is_removed(self):
+        """Rule 2 blocks deleting a role we only adopted -- but the grant this sample
+        attached must still go, or a role we do not own keeps standing read access to the
+        secret and credential provider this same cleanup just deleted."""
+        role = "agentcore-DatabricksGenieGateway-role"
+        _, iam, _, _ = self.run_cleanup(self.state(owned_role=False), policy_attached=True)
+        self.assertIn(("delete_role_policy", role), iam.calls)
+        self.assertNotIn(("delete_role", role), iam.calls)
+
     def test_no_gateway_recorded_still_tears_down_pool_and_role(self):
         """deploy.py records the pool and role before the gateway exists."""
         agentcore, iam, cognito, removed = self.run_cleanup(self.state(gateway_id=None, provider_arn=None))
@@ -219,3 +234,50 @@ class DeployGuardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoleOwnershipTest(unittest.TestCase):
+    """Ownership must never downgrade when deploy re-runs over its own IAM role.
+
+    Deploy #1 can create the role, record owned_role=true, then fail before the gateway
+    exists. gateway_id is still null so rule 3 permits a re-run, and that re-run finds
+    its OWN role via EntityAlreadyExists. Reporting that as adopted made cleanup print
+    "this sample did not create it" forever, leaving a role nothing could remove.
+    """
+
+    class _Iam:
+        def __init__(self):
+            self.exceptions = mock.Mock(EntityAlreadyExistsException=_EntityAlreadyExistsException)
+
+        def create_role(self, **kwargs):
+            raise _EntityAlreadyExistsException("role already exists")
+
+        def update_assume_role_policy(self, **kwargs):
+            pass
+
+        def get_role(self, RoleName):  # noqa: N803 - boto3 casing
+            return {"Role": {"Arn": f"arn:aws:iam::1:role/{RoleName}"}}
+
+    def _make_setup(self):
+        import gateway_setup  # noqa: PLC0415 - imported here so the module stays light
+
+        fake_iam = self._Iam()
+
+        def fake_client(service, **kwargs):
+            if service == "iam":
+                return fake_iam
+            if service == "sts":
+                return mock.Mock(get_caller_identity=mock.Mock(return_value={"Account": "1"}))
+            return mock.Mock()
+
+        with mock.patch.object(gateway_setup.boto3, "client", side_effect=fake_client):
+            return gateway_setup.GatewaySetup("us-west-2")
+
+    def test_a_role_this_sample_created_is_still_owned_after_a_re_run(self):
+        _, owned = self._make_setup().create_gateway_role("G", previously_owned=True)
+        self.assertTrue(owned, "cleanup would refuse to delete a role this sample created")
+
+    def test_a_genuinely_pre_existing_role_is_not_claimed(self):
+        _, owned = self._make_setup().create_gateway_role("G", previously_owned=False)
+        self.assertFalse(owned, "cleanup would delete a role belonging to something else")
+

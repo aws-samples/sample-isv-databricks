@@ -1,6 +1,8 @@
 # Generated at deploy time — holds the Cognito client secret, gateway/target/provider
-# ARNs and the AWS account id. Never commit.
-gateway_config.json
+# ARNs and the AWS account id. Never commit. The glob also covers
+# gateway_config.json.tmp, which write_state leaves behind if a deploy is interrupted
+# between the write and the rename, and which holds the same secret.
+gateway_config.json*
 
 # Written by `agentcore configure` / `agentcore deploy` — runtime/agent ARNs, ECR uri.
 .bedrock_agentcore.yaml
