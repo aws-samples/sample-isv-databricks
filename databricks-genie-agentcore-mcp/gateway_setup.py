@@ -5,6 +5,7 @@ rather than the deprecated starter toolkit. Follows the same approach as
 01-features/07-centralize-and-govern-your-ai-infrastructure/01-gateway.
 """
 
+import fnmatch
 import json
 import secrets
 import time
@@ -298,14 +299,32 @@ class GatewaySetup:
         except Exception as exc:  # noqa: BLE001
             print(f"  could not read the adopted role's trust policy, continuing: {exc}")
             return
-        blob = json.dumps(doc)
-        if f"arn:aws:bedrock-agentcore:{self.region}:" in blob or "bedrock-agentcore:*:" in blob:
-            return
+        statements = doc.get("Statement") or []
+        if isinstance(statements, dict):
+            statements = [statements]
+        probe = f"arn:aws:bedrock-agentcore:{self.region}:{self.account_id}:gateway/probe"
+        for statement in statements:
+            # Substring-matching the whole document was wrong both ways: a role that trusts
+            # the service with NO aws:SourceArn condition is assumable from anywhere, and was
+            # rejected with a made-up "belongs to another region" diagnosis; while a region
+            # literal sitting in an unrelated or Deny statement satisfied it.
+            if statement.get("Effect") != "Allow":
+                continue
+            if "bedrock-agentcore.amazonaws.com" not in json.dumps(statement.get("Principal", "")):
+                continue
+            patterns = ((statement.get("Condition") or {}).get("ArnLike") or {}).get("aws:SourceArn")
+            if patterns is None:
+                return  # trusts the service unconditionally, so this region can assume it
+            if isinstance(patterns, str):
+                patterns = [patterns]
+            if any(fnmatch.fnmatch(probe, pattern) for pattern in patterns):
+                return
         raise SystemExit(
-            f"IAM role {role_name} already exists but its trust policy does not allow "
-            f"bedrock-agentcore in {self.region}. It belongs to a deployment in another "
-            "region: this sample uses fixed resource names, so one deployment per account "
-            "is supported. Delete that deployment first, or run this one in its region."
+            f"IAM role {role_name} already exists, but no statement in its trust policy lets "
+            f"bedrock-agentcore in {self.region} assume it — most likely it belongs to a "
+            "deployment in another region. This sample uses fixed resource names, so one "
+            "deployment per account is supported: tear that one down with cleanup.py first, "
+            "or run this deployment in its region."
         )
 
     def grant_oauth_permissions(self, role_arn: str, policy_name: str, provider_arn: str, secret_arn: str) -> None:

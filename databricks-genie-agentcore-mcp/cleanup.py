@@ -120,6 +120,7 @@ def main() -> None:
         print(f"  IAM role              {config['role_arn'].split('/')[-1]}")
     elif config.get("role_arn"):
         print(f"  IAM role              {config['role_arn'].split('/')[-1]}  (adopted, will NOT be deleted)")
+        print(f"                        its {IAM_POLICY_NAME} policy is removed only if this deployment wrote it")
     if pool_id and owns_pool:
         print(f"  Cognito user pool     {pool_id}")
     elif pool_id:
@@ -220,6 +221,9 @@ def main() -> None:
             try:
                 iam.delete_role_policy(RoleName=role_name, PolicyName=IAM_POLICY_NAME)
                 print(f"Removed this deployment's inline policy from adopted IAM role {role_name}.")
+            except iam.exceptions.NoSuchEntityException:
+                # Removed between the read and the delete. Rule 7: already gone is success.
+                pass
             except Exception as exc:  # noqa: BLE001
                 print(f"Could not delete inline policy on {role_name}: {exc}")
                 failures.append("IAM inline policy")

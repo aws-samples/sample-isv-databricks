@@ -199,9 +199,24 @@ class ContractTest(unittest.TestCase):
         role = "agentcore-DatabricksGenieGateway-role"
         doc = {"Statement": [{"Action": "bedrock-agentcore:GetResourceOauth2Token",
                              "Resource": ["arn:aws:bedrock-agentcore:us-west-2:1:token-vault/default/oauth2credentialprovider/databricks-genie-oauth", "arn:aws:bedrock-agentcore:us-west-2:1:token-vault/default"]}]}
-        _, iam, _, _ = self.run_cleanup(self.state(owned_role=False), policy_doc=doc)
+        _, iam, _, state_kept = self.run_cleanup(
+            self.state(owned_role=False), policy_doc=doc, policy_attached=True)
         self.assertIn(("delete_role_policy", role), iam.calls)
         self.assertNotIn(("delete_role", role), iam.calls)
+        # Without policy_attached the fake raises NoSuchEntity and this passed while the run
+        # actually printed "Could not delete inline policy" and kept the state file, so the
+        # clean exit is asserted too -- the call alone is not evidence the delete succeeded.
+        self.assertFalse(state_kept, "a clean teardown must remove the state file")
+
+    def test_a_policy_that_vanishes_between_read_and_delete_is_still_a_clean_teardown(self):
+        """Rule 7: already gone is success. get_role_policy sees our document, then the delete
+        finds nothing -- removed by another operator in between. Reporting that as a failure
+        keeps a state file for a teardown that actually completed."""
+        doc = {"Statement": [{"Resource": ["arn:aws:bedrock-agentcore:us-west-2:1:token-vault/default/oauth2credentialprovider/databricks-genie-oauth"]}]}
+        _, iam, _, state_kept = self.run_cleanup(
+            self.state(owned_role=False), policy_doc=doc, policy_attached=False)
+        self.assertIn(("delete_role_policy", "agentcore-DatabricksGenieGateway-role"), iam.calls)
+        self.assertFalse(state_kept, "an already-gone policy must not be reported as a failure")
 
     def test_another_deployments_policy_is_not_removed(self):
         """A different provider ARN means another deployment wrote it -- deleting it there
@@ -478,16 +493,44 @@ class AdoptedTrustPolicyTest(unittest.TestCase):
             return gateway_setup.GatewaySetup("us-west-2")
 
     def test_a_role_scoped_to_another_region_fails_loudly(self):
-        doc = {"Statement": [{"Condition": {"ArnLike": {
-            "aws:SourceArn": "arn:aws:bedrock-agentcore:us-east-1:1:*"}}}]}
+        doc = {"Statement": [{"Effect": "Allow",
+                              "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                              "Condition": {"ArnLike": {
+                                  "aws:SourceArn": "arn:aws:bedrock-agentcore:us-east-1:1:*"}}}]}
         setup = self._setup(doc)
         with self.assertRaises(SystemExit) as ctx:
             setup.create_gateway_role("G", previously_owned=False)
         self.assertIn("us-west-2", str(ctx.exception))
 
+    def test_a_role_with_no_source_arn_condition_is_accepted(self):
+        """Trusting the service unconditionally is MORE permissive, not less. Substring
+        matching rejected it with a made-up 'belongs to another region' diagnosis."""
+        doc = {"Statement": [{"Effect": "Allow",
+                              "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                              "Action": "sts:AssumeRole",
+                              "Condition": {"StringEquals": {"aws:SourceAccount": "1"}}}]}
+        _, owned = self._setup(doc).create_gateway_role("G", previously_owned=False)
+        self.assertFalse(owned)
+
+    def test_a_wildcard_region_is_accepted(self):
+        doc = {"Statement": [{"Effect": "Allow",
+                              "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                              "Condition": {"ArnLike": {"aws:SourceArn": "arn:aws:bedrock-agentcore:*:1:*"}}}]}
+        _, owned = self._setup(doc).create_gateway_role("G", previously_owned=False)
+        self.assertFalse(owned)
+
+    def test_a_region_literal_in_a_deny_statement_does_not_satisfy_the_guard(self):
+        doc = {"Statement": [{"Effect": "Deny",
+                              "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                              "Condition": {"ArnLike": {"aws:SourceArn": "arn:aws:bedrock-agentcore:us-west-2:1:*"}}}]}
+        with self.assertRaises(SystemExit):
+            self._setup(doc).create_gateway_role("G", previously_owned=False)
+
     def test_a_role_scoped_to_this_region_is_accepted(self):
-        doc = {"Statement": [{"Condition": {"ArnLike": {
-            "aws:SourceArn": "arn:aws:bedrock-agentcore:us-west-2:1:*"}}}]}
+        doc = {"Statement": [{"Effect": "Allow",
+                              "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                              "Condition": {"ArnLike": {
+                                  "aws:SourceArn": "arn:aws:bedrock-agentcore:us-west-2:1:*"}}}]}
         _, owned = self._setup(doc).create_gateway_role("G", previously_owned=False)
         self.assertFalse(owned)
 
