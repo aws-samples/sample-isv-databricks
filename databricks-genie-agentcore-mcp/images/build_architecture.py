@@ -15,7 +15,7 @@ as the AgentCore workshops in this repo.
 
 Usage:
     python build_architecture.py             # rebuild from the committed icons_b64.json cache
-    python build_architecture.py --icons /path/to/unpacked/asset-package  # refresh the cache
+    python build_architecture.py --icons /path/to/icon-root  # refresh the cache
     rsvg-convert -w 2064 architecture.svg -o architecture.png
 
 The committed icons_b64.json holds every mark as a data URI, so a clean checkout
@@ -28,6 +28,11 @@ import argparse
 import base64
 import json
 import os
+
+# The only entry the AWS toolkit release does not ship. A refresh may fall back to the
+# committed export for THIS key alone -- falling back for any missing icon turned
+# `--icons /wrong/path` into a silent success that rewrote the cache with itself.
+OPTIONAL_ICONS = {"agentcore"}
 
 ICON_SOURCES = {
     # Amazon Bedrock AgentCore mark: a standalone brand export, not shipped in the
@@ -50,25 +55,52 @@ ICON_SOURCES = {
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument(
     "--icons",
-    default=".",
+    default=None,
     help="Root holding the unpacked AWS toolkit and a databricks/ folder.",
 )
 parser.add_argument("--cache", default="icons_b64.json", help="Data-URI cache.")
 args = parser.parse_args()
 
+# Use argparse's own signal rather than re-scanning sys.argv: a manual scan misses the
+# abbreviations argparse accepts (--icon, --ic), which silently took the cache path.
+_icons_explicit = args.icons is not None
+
 
 def load_icons() -> dict:
-    """Return {name: data-URI}, reading from source icons or a local cache."""
+    """Return {name: data-URI}, reading from source icons or a local cache.
+
+    The cache short-circuit only applies when --icons was not passed explicitly.
+    icons_b64.json is committed, so it always exists in a clean checkout, which made
+    the documented `--icons /path/to/icon-root` refresh a silent no-op: the user
+    got "wrote architecture.svg" and the old icons.
+    """
+    cached = {}
     if os.path.exists(args.cache):
-        with open(args.cache) as f:
-            return json.load(f)
+        try:
+            with open(args.cache) as f:
+                cached = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            # A truncated or hand-edited cache must not break the documented refresh path,
+            # which is exactly the command someone runs to rebuild it.
+            print(f"  ignoring unreadable {args.cache}: {exc}")
+            cached = {}
+        if cached and not _icons_explicit:
+            return cached
 
     icons = {}
     for name, rel in ICON_SOURCES.items():
-        path = os.path.join(args.icons, rel)
+        path = os.path.join(args.icons or ".", rel)
         if not os.path.exists(path):
+            # Only OPTIONAL_ICONS may fall back, and only when the cache actually has it.
+            # Anything else missing means the --icons root is wrong, and the run must fail
+            # rather than quietly rewrite the cache with its own contents.
+            if name in OPTIONAL_ICONS and name in cached:
+                print(f"  {name}: not in this toolkit release, keeping the committed icon")
+                icons[name] = cached[name]
+                continue
             raise SystemExit(
-                f"Icon not found: {path}\nPass --icons pointing at the unpacked AWS Architecture Icons asset package."
+                f"Icon not found: {path}\n--icons must point at a root holding BOTH the unpacked AWS "
+                f"Architecture Icons asset package and a databricks/ folder with the Databricks marks."
             )
         mime = "image/svg+xml" if path.endswith(".svg") else "image/png"
         with open(path, "rb") as f:
@@ -257,6 +289,10 @@ a(
 
 a("</svg>")
 
-with open("architecture.svg", "w") as f:
+# encoding is explicit: the SVG carries U+2014, U+00B7 and U+2019, so relying on the
+# locale default raised UnicodeEncodeError under LC_ALL=C (CI, slim containers) and
+# silently wrote non-UTF-8 bytes under a latin-1 locale. The file has no XML
+# declaration, so renderers assume UTF-8 per the XML spec.
+with open("architecture.svg", "w", encoding="utf-8") as f:
     f.write("\n".join(p))
 print("wrote architecture.svg")

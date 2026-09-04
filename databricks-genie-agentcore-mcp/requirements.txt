@@ -1,7 +1,15 @@
-strands-agents
-strands-agents-tools
-bedrock-agentcore
-mcp
-boto3
-requests
-pyyaml
+# Every pin is `~=`: a floor plus a same-major ceiling. The floor is the release that
+# introduced what this sample calls; the ceiling keeps a major bump from arriving silently
+# in a reader's first `pip install`.
+# mcp is capped below 2.x because strands-agents requires it -- strands-agents 1.54 declares
+# `mcp>=1.23.0,<2.0.0`, so a 2.x pin here makes the resolver fail. Within 1.x the floor is
+# 1.29, the release where LATEST_PROTOCOL_VERSION becomes "2025-11-25", the version this
+# gateway declares (MCP_PROTOCOL_VERSION in gateway_setup.py); older clients fail the
+# initialize handshake.
+strands-agents~=1.53
+bedrock-agentcore~=1.22
+mcp~=1.29
+boto3~=1.43
+requests~=2.34
+pyyaml~=6.0
+python-dotenv~=1.2

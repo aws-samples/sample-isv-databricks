@@ -5,15 +5,15 @@ Steps performed:
     2. Create the gateway with a Cognito authorizer (inbound auth)
     3. Create the Databricks OAuth2 M2M credential provider (outbound auth)
     4. Grant the gateway role permission to use that provider
-    5. Register the Databricks-managed Genie MCP endpoint as a gateway target
-    6. Wait for the target and synchronize the tool surface
-    7. Write gateway_config.json for invoke.py / genie_agent.py / cleanup.py
+    5. Register the Genie MCP endpoint as a target, wait for it, sync the tool surface
+    6. Write gateway_config.json for invoke.py / genie_agent.py / cleanup.py
 
 Usage:
     python deploy.py
 """
 
 import json
+import os
 import time
 
 import boto3
@@ -40,33 +40,108 @@ def banner(step: str) -> None:
     print("=" * 60)
 
 
+def _initial_state(prior_state: dict | None) -> dict:
+    """Build the state dict for this run, carrying forward what already exists.
+
+    Starting every field at None meant the first persist of a re-run erased the resources
+    the previous attempt had recorded. A deploy that created the role and then died before
+    the gateway left role_arn=null on disk, so cleanup skipped IAM entirely and orphaned
+    the role -- and the next run read no owned_role and reported it adopted, defeating the
+    ownership guard by a different route.
+    """
+    prior_state = prior_state or {}
+    state = {
+        "gateway_id": None,
+        "gateway_url": None,
+        "target_id": None,
+        "provider_arn": None,
+        "genie_space_id": GENIE_SPACE_ID,
+        "region": AWS_REGION,
+        "client_info": None,
+        "role_arn": None,
+        "databricks_host": DATABRICKS_HOST,
+    }
+    for key in ("client_info", "role_arn", "owned_role", "provider_arn", "target_id"):
+        if prior_state.get(key) is not None:
+            state[key] = prior_state[key]
+    return state
+
+
 def write_state(config: dict) -> None:
     """Persist gateway_config.json for invoke.py / genie_agent.py / cleanup.py."""
-    with open(STATE_FILE, "w") as f:
+    # Write-then-rename: this now runs several times per deploy, and a Ctrl-C partway
+    # through a plain write leaves a truncated file that hides a live deployment.
+    tmp = f"{STATE_FILE}.tmp"
+    with open(tmp, "w") as f:
         json.dump(config, f, indent=2)
+    os.replace(tmp, STATE_FILE)
     print(f"  Wrote {STATE_FILE}")
 
 
-def create_gateway(setup: GatewaySetup) -> dict:
-    """Create the Cognito authorizer, the IAM role and the MCP gateway."""
+def create_gateway(setup: GatewaySetup, persist, prior_state=None) -> dict:
+    """Create the Cognito authorizer, the IAM role and the MCP gateway.
+
+    Persists the state file after EACH resource is created. Previously all five
+    resources (pool, domain, resource server, app client, role) were built before
+    the first write, so a CreateGateway failure -- a throttle, a quota, or a
+    protocolConfiguration validation error -- exited with real resources and no
+    state, and cleanup.py then refused to run at all.
+    """
+    state = _initial_state(prior_state)
+
     print("Creating Cognito authorizer (inbound auth)...")
-    client_info = setup.create_cognito_authorizer(GATEWAY_NAME)
+    def _record_pool(partial: dict) -> None:
+        # Contract rule 1: the pool and its domain are recorded the moment they exist,
+        # before the ACTIVE wait -- which can fail and previously stranded both.
+        state["client_info"] = dict(partial)
+        persist(state)
+
+    prior_owned = bool((prior_state.get("client_info") or {}).get("owned_pool"))
+    state["client_info"] = setup.create_cognito_authorizer(
+        GATEWAY_NAME, on_created=_record_pool, previously_owned=prior_owned
+    )
+    persist(state)
 
     print("Creating gateway execution role...")
-    role_arn = setup.create_gateway_role(GATEWAY_NAME)
+
+    def _record_role(role_arn: str, owned: bool) -> None:
+        # Contract rule 1, same reason as _record_pool: the role is recorded the moment
+        # CreateRole returns, before the 10s propagation sleep inside create_gateway_role.
+        state["role_arn"], state["owned_role"] = role_arn, owned
+        persist(state)
+
+    prior_owned_role = bool(prior_state.get("owned_role"))
+    state["role_arn"], state["owned_role"] = setup.create_gateway_role(
+        GATEWAY_NAME, on_created=_record_role, previously_owned=prior_owned_role
+    )
+    persist(state)
 
     print("Creating gateway...")
-    gateway = setup.create_mcp_gateway(GATEWAY_NAME, role_arn, client_info)
+    gateway = setup.create_mcp_gateway(GATEWAY_NAME, state["role_arn"], state["client_info"])
+    state["gateway_id"] = gateway["gatewayId"]
+    state["gateway_url"] = gateway["gatewayUrl"]
+    persist(state)
+
     print("  Waiting 30s for IAM propagation...")
     time.sleep(30)
-    return {"gateway": gateway, "client_info": client_info, "role_arn": role_arn}
+    return state
 
 
 def create_credential_provider(agentcore) -> tuple:
     """Register Databricks OAuth2 client-credentials as an outbound provider."""
     token_endpoint = f"{DATABRICKS_HOST}/oidc/v1/token"
+    # Databricks publishes these separately: /oidc/v1/token and /oidc/v1/authorize
+    # (confirmed via the workspace's /oidc/.well-known/oauth-authorization-server).
+    # Unused under CLIENT_CREDENTIALS, but pointing it at the token endpoint broke
+    # the authorization-code path the README points readers toward.
+    authorization_endpoint = f"{DATABRICKS_HOST}/oidc/v1/authorize"
 
     print("Creating Databricks OAuth2 credential provider...")
+    # Deliberately no pre-emptive delete here. A live target holds a
+    # credentialProviderConfigurations reference to this provider, so removing it would
+    # break a working deployment before anything is recreated -- and the name is shared
+    # across deployments in an account. Surface the conflict and let cleanup.py own
+    # teardown (contract rule 6).
     provider = agentcore.create_oauth2_credential_provider(
         name=CREDENTIAL_PROVIDER_NAME,
         credentialProviderVendor="CustomOauth2",
@@ -76,7 +151,7 @@ def create_credential_provider(agentcore) -> tuple:
                     "authorizationServerMetadata": {
                         "issuer": DATABRICKS_HOST,
                         "tokenEndpoint": token_endpoint,
-                        "authorizationEndpoint": token_endpoint,
+                        "authorizationEndpoint": authorization_endpoint,
                     }
                 },
                 "clientId": DATABRICKS_CLIENT_ID,
@@ -85,7 +160,10 @@ def create_credential_provider(agentcore) -> tuple:
         },
     )
     provider_arn = provider["credentialProviderArn"]
-    secret_arn = provider.get("secretArn") or provider.get("clientSecretArn", {}).get("secretArn", "")
+    _client_secret = provider.get("clientSecretArn")
+    if isinstance(_client_secret, dict):
+        _client_secret = _client_secret.get("secretArn", "")
+    secret_arn = provider.get("secretArn") or _client_secret or ""
     if not secret_arn:
         # The response shape isn't stable, so we probe two known keys above; if
         # both miss we get "". Fail loudly here: an empty ARN would drop the
@@ -108,7 +186,7 @@ def grant_gateway_permissions(setup: GatewaySetup, role_arn: str, provider_arn: 
     setup.grant_oauth_permissions(role_arn, IAM_POLICY_NAME, provider_arn, secret_arn)
 
 
-def register_genie_target(agentcore, gateway_id: str, provider_arn: str) -> str:
+def register_genie_target(agentcore, gateway_id: str, provider_arn: str, on_created=None) -> str:
     """Register the Databricks-managed Genie MCP server as a gateway target."""
     mcp_url = genie_mcp_url()
     print(f"Registering Genie MCP target: {mcp_url}")
@@ -134,6 +212,8 @@ def register_genie_target(agentcore, gateway_id: str, provider_arn: str) -> str:
     )
     target_id = target["targetId"]
     print(f"  Target ID: {target_id}")
+    if on_created is not None:
+        on_created(target_id)  # contract rule 1: recorded before the READY wait can fail
 
     # The API reports status in upper case (CREATING / READY / FAILED), so
     # compare case-insensitively — SynchronizeGatewayTargets rejects a target
@@ -163,6 +243,27 @@ def register_genie_target(agentcore, gateway_id: str, provider_arn: str) -> str:
 def deploy() -> None:
     require_databricks_config()
 
+    # Contract rule 3. Checked before anything is created: there is no reuse path for a
+    # gateway or a target, so a re-run cannot succeed -- and its first state write would
+    # record gateway_id=None, hiding a live gateway and target from cleanup.py.
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                existing = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            # Do NOT treat an unreadable file as "no deployment" -- a truncated write is
+            # exactly the case most likely to be hiding a live gateway.
+            raise SystemExit(
+                f"{STATE_FILE} exists but could not be read ({exc}). It may be a truncated "
+                "write hiding a live deployment. Inspect it, or move it aside if you are "
+                "certain it is stale."
+            ) from None
+        if existing.get("gateway_id"):
+            raise SystemExit(
+                f"{STATE_FILE} already records gateway {existing['gateway_id']}.\n"
+                "Run `python cleanup.py` first, or move that file aside if you know it is stale."
+            )
+
     banner("STEP 1: Verify AWS Credentials")
     identity = boto3.client("sts").get_caller_identity()
     print(f"  Account: {identity['Account']}")
@@ -173,38 +274,26 @@ def deploy() -> None:
     agentcore = setup.client
 
     banner("STEP 2: Create AgentCore Gateway")
-    created = create_gateway(setup)
-    gateway = created["gateway"]
-    gateway_id = gateway["gatewayId"]
-
-    # Write the state file now, before steps 3-5 create anything a later failure
-    # could strand. The gateway, its IAM role and the Cognito pool already exist;
-    # if the credential provider (step 3), the permission grant (step 4) or the
-    # target (step 5) then fails -- including the empty-ARN guard below -- cleanup.py
-    # needs gateway_config.json to tear those three back down. target_id and
-    # provider_arn are filled in once step 5 succeeds.
-    config = {
-        "gateway_id": gateway_id,
-        "gateway_url": gateway["gatewayUrl"],
-        "target_id": None,
-        "provider_arn": None,
-        "genie_space_id": GENIE_SPACE_ID,
-        "region": AWS_REGION,
-        # Cognito inbound-auth client; mints the gateway bearer token.
-        "client_info": created["client_info"],
-        "role_arn": created["role_arn"],
-        "databricks_host": DATABRICKS_HOST,
-    }
-    write_state(config)
+    # create_gateway persists after every resource, so any failure inside step 2
+    # still leaves cleanup.py enough state to tear down what already exists.
+    config = create_gateway(setup, write_state, prior_state=existing if os.path.exists(STATE_FILE) else {})
+    gateway_id = config["gateway_id"]
 
     banner("STEP 3: Create Databricks OAuth2 Credential Provider")
     provider_arn, secret_arn = create_credential_provider(agentcore)
 
+    config["provider_arn"] = provider_arn
+    write_state(config)
+
     banner("STEP 4: Grant Gateway Role Permissions")
-    grant_gateway_permissions(setup, created["role_arn"], provider_arn, secret_arn)
+    grant_gateway_permissions(setup, config["role_arn"], provider_arn, secret_arn)
 
     banner("STEP 5: Register Databricks Genie MCP Target")
-    target_id = register_genie_target(agentcore, gateway_id, provider_arn)
+    def _record_target(tid: str) -> None:
+        config["target_id"] = tid
+        write_state(config)
+
+    target_id = register_genie_target(agentcore, gateway_id, provider_arn, _record_target)
 
     banner("STEP 6: Save Configuration")
     config["target_id"] = target_id

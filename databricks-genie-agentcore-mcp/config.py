@@ -13,6 +13,17 @@ each one.
 
 import os
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # optional dependency; `export`-only workflows still work
+    load_dotenv = None
+
+if load_dotenv is not None:
+    # .env.example tells the reader to copy it to .env. Nothing loaded that file, so
+    # following the instruction produced "Missing required environment variable(s)"
+    # even with every value filled in correctly.
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
 # --- Databricks -------------------------------------------------------------
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "").rstrip("/")
 DATABRICKS_CLIENT_ID = os.environ.get("DATABRICKS_CLIENT_ID", "")
@@ -21,9 +32,23 @@ GENIE_SPACE_ID = os.environ.get("GENIE_SPACE_ID", "")
 
 # --- AWS --------------------------------------------------------------------
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
+# A "global." cross-region inference profile, chosen deliberately over a "us." one: the
+# us.* profiles only resolve in US regions. Note that the current Anthropic profiles carry
+# no date/version suffix -- "global.anthropic.claude-sonnet-5" is the whole id, verified
+# ACTIVE and callable in us-east-1 via get-inference-profile and a converse call.
+# Bedrock can also gate an older model line on an account that has not called it recently,
+# which surfaces as ResourceNotFoundException on the first question rather than as a
+# model-access error, so a current model is the safer default for a fresh account.
+# List what your own account can call with: aws bedrock list-inference-profiles
+MODEL_ID = os.environ.get("MODEL_ID", "global.anthropic.claude-sonnet-5")
 
 # --- Resource names ---------------------------------------------------------
+# Fixed names, deliberately: they keep the walkthrough readable and cleanup unambiguous.
+# The consequence is that ONE deployment per AWS account is supported. A second deployment
+# -- in this or any other region -- adopts this role name and overwrites the shared inline
+# policy under IAM_POLICY_NAME, which breaks the first deployment's tool calls. deploy.py
+# fails loudly when it detects an adopted role from another region; it cannot detect a
+# concurrent deployment in the same region, so do not run two.
 GATEWAY_NAME = "DatabricksGenieGateway"
 TARGET_NAME = "DatabricksGenie"
 CREDENTIAL_PROVIDER_NAME = "databricks-genie-oauth"

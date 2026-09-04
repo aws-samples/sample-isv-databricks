@@ -21,15 +21,24 @@ This sample registers the [Databricks-managed Genie MCP endpoint](https://docs.d
 - **Outbound auth** — Databricks OAuth2 M2M credentials, registered via `CreateOauth2CredentialProvider` (scoped to `genie`) and retrieved by Gateway at tool-invocation time
 - **Audit** — Unity Catalog audit logs attribute SQL execution to the service principal; AgentCore Runtime and Gateway emit CloudWatch traces for each tool invocation
 
-> **Auth model.** This sample uses machine-to-machine (client-credentials) auth end to end, so Genie runs as the service principal — the right model for a shared, application-level integration where every caller shares one permission set. The same `mcpServer` target also supports per-user access via OAuth token exchange (`grantType: TOKEN_EXCHANGE`) or authorization code, in which case Unity Catalog enforces each end user's own permissions; see the [outbound authorization matrix](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-outbound-auth.html) for what each target type supports.
+> **Auth model.** This sample uses machine-to-machine (client-credentials) auth end to end, so Genie runs as the service principal, and Unity Catalog audit attributes every query to that service principal — not to the person who asked. That is the right model for a shared, application-level integration where all callers share one permission set. It also means **this sample does not give you per-user authorization**.
+>
+> Per-user authorization is out of scope for this sample and is not something it has been tested with. If you adapt it for per-user identity, note that Databricks gates the OAuth token-exchange grant behind an **account federation policy** trusting the token issuer — without one, a token-exchange request against the workspace returns `invalid_grant` with `Failed to process token: TOKEN_INVALID (Ensure a valid federation policy has been configured)`. Configure that first, then confirm in the Unity Catalog audit logs **whose identity actually reached Unity Catalog** rather than inferring it from the grant type. See the [outbound authorization matrix](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-outbound-auth.html) for what each target type supports.
 
 ## Prerequisites
 
-1. AWS credentials configured (`aws configure`) with permissions to create AgentCore resources and IAM roles, plus Bedrock foundation-model access in your region (Claude, Nova, or your preferred model)
+> **One deployment per AWS account.** This sample uses fixed resource names (gateway,
+> IAM role, inline policy, credential provider), which keeps the walkthrough readable but
+> means a second deployment adopts the same role name and overwrites the shared inline
+> policy, breaking the first deployment's tool calls. `deploy.py` fails loudly if it finds
+> an adopted role belonging to another region; it cannot detect a concurrent deployment in
+> the same region. Tear one down with `cleanup.py` before standing up another.
+
+1. AWS credentials configured (`aws configure`) with permissions to create AgentCore resources and IAM roles, plus **Bedrock access to a current model**. The default is the `global.anthropic.claude-sonnet-5` cross-region inference profile; override it with `MODEL_ID`. Note that current Anthropic profile ids carry no date/version suffix — `global.anthropic.claude-sonnet-5` is the whole id. Confirm what your own account can call with `aws bedrock list-inference-profiles`; Bedrock can gate an older model line on an account that has not called it recently, and that surfaces as a `ResourceNotFoundException` on your first question rather than as a model-access error.
 2. Databricks workspace on AWS with Unity Catalog enabled and at least one [Genie Space](https://docs.databricks.com/en/genie/index.html) with Trusted Assets defined
 3. Databricks service principal with an [OAuth M2M secret](https://docs.databricks.com/en/dev-tools/auth/oauth-m2m.html). The service principal needs **all three** of the following — see [Service principal permissions](#service-principal-permissions) below, as a missing grant does not surface until the first real query:
-   - `CAN RUN` on the Genie space
-   - `CAN USE` on the SQL warehouse that backs the Genie space
+   - `CAN_RUN` on the Genie space
+   - `CAN_USE` on the SQL warehouse that backs the Genie space
    - `USE CATALOG` / `USE SCHEMA` / `SELECT` on the tables behind it
 4. Python 3.10+ (`pip install -r requirements.txt`)
 
@@ -72,7 +81,9 @@ Symptoms of each missing grant, as returned inside the Genie message payload:
 
 ## Configuration
 
-All configuration comes from environment variables — nothing is stored in the repo:
+All configuration comes from environment variables — nothing is stored in the repo. Either
+`export` them as below, or copy `.env.example` to `.env` and fill it in; `config.py` loads
+that file if present.
 
 ```bash
 export DATABRICKS_HOST="https://dbc-xxxxxxxx-xxxx.cloud.databricks.com"
@@ -109,7 +120,12 @@ python deploy.py
 2. **Create the gateway** — creates a Cognito user pool, domain, resource server and
    machine-to-machine app client for inbound auth; creates a least-privilege gateway
    execution role; then calls `CreateGateway` with a `CUSTOM_JWT` authorizer pointed at
-   the pool's OIDC discovery URL. Waits 30s for IAM propagation.
+   the pool's OIDC discovery URL. Waits 30s for IAM propagation. An existing pool of the
+   same name is reused rather than duplicated, so a re-run does not leak one, and the
+   script blocks until the Cognito hosted-UI domain reports `ACTIVE` — that domain hosts
+   the token endpoint and its CloudFront distribution can take several minutes, so
+   continuing early produced a bare DNS failure in the next step. The state file is
+   written as each resource is created, so an interrupted run is still cleanable.
 3. **Create the Databricks credential provider** — registers the service principal's
    OAuth2 client credentials via `create_oauth2_credential_provider()`, pointing
    discovery at your workspace's `/oidc/v1/token` endpoint. This is the outbound auth
@@ -138,16 +154,48 @@ streamable-HTTP, hands the discovered tools to a Strands `Agent`, and asks your
 question. Run this before deploying — it isolates auth and grant problems from
 deployment problems.
 
+> **First question is slow.** If the SQL warehouse behind your Genie space is stopped,
+> the first query cold-starts it and can take a couple of minutes. That is the warehouse
+> starting, not a broken integration.
+
 ### 3. Deploy to AgentCore Runtime
 
+> **The `agentcore` CLI used below is deprecated.** These commands come from
+> `bedrock-agentcore-starter-toolkit`, which is deliberately **not** in
+> `requirements.txt` — installing it prints "The Starter Toolkit CLI is no longer
+> supported" and points at `@aws/agentcore` (`npm install -g @aws/agentcore`). The
+> replacement is not a drop-in: it scaffolds a project (`app/` plus an `agentcore/`
+> directory holding `agentcore.json` and a CDK project) rather than configuring a script
+> in place, and it does not use the `.bedrock_agentcore.yaml` that `invoke_runtime.py`
+> reads. Migrating this sample to it is a separate change. If you have already deployed
+> with the starter toolkit, `agentcore import runtime` adopts an existing runtime rather
+> than rebuilding it. Install the starter toolkit explicitly if you want to follow the
+> steps below as written:
+>
+> ```bash
+> pip install bedrock-agentcore-starter-toolkit
+> ```
+
 ```bash
-agentcore configure --entrypoint genie_agent.py
+agentcore configure --entrypoint genie_agent.py   # interactive: prompts for deployment type
 agentcore deploy
 python invoke_runtime.py
 ```
 
-`genie_agent.py` wraps the same MCP client in a `BedrockAgentCoreApp` entrypoint,
-resolving the tool surface once at cold start rather than per request.
+`genie_agent.py` wraps the same MCP client in a `BedrockAgentCoreApp` entrypoint. The
+Cognito token and the MCP session are established per invocation rather than once at cold
+start: client-credentials tokens expire while a warm container does not, so a cold-start
+token left every request after expiry failing with a 401.
+
+> **Pass configuration as environment variables, not as a file.** `gateway_config.json`
+> is gitignored and holds the Cognito client secret. Depending on the toolkit version the
+> build may exclude it from the image — in which case the agent has no configuration — or
+> include it, which bakes a long-lived OAuth secret into an ECR layer. Neither is what you
+> want. Set these five on the Runtime instead, reading the values from `gateway_config.json`
+> on your machine: `GATEWAY_URL`, `COGNITO_TOKEN_ENDPOINT`, `COGNITO_CLIENT_ID`,
+> `COGNITO_CLIENT_SECRET`, `COGNITO_SCOPE`. For anything beyond a sample, hold the secret
+> in Secrets Manager and grant the Runtime role read access rather than passing it inline.
+> `genie_agent.py` prefers these variables and falls back to the state file for local runs.
 
 > **Check the region.** `agentcore configure` may default to a different region than
 > the one you created the gateway in. The deployed agent must run in the **same
@@ -156,9 +204,10 @@ resolving the tool surface once at cold start rather than per request.
 
 ### 4. Validate governance
 
-Unity Catalog audit logs attribute the SQL execution to the service principal, and
-AgentCore Runtime and Gateway emit CloudWatch traces for each tool invocation — so a
-single question can be followed from agent prompt through to the SQL that answered it.
+Unity Catalog audit logs record the SQL executed by the service principal, and AgentCore
+Runtime and Gateway emit CloudWatch traces for each tool invocation. Check both to confirm
+what actually ran and under whose identity — this is the step that tells you whether the
+governance story holds in your own workspace.
 
 ### 5. Clean up
 

@@ -61,7 +61,12 @@ def main() -> None:
             return
 
         agent = Agent(
-            model=BedrockModel(model_id=MODEL_ID),
+            # The region recorded in the state file, which is where deploy.py actually put
+            # the gateway. Omitting it entirely let strands fall back to its own default
+            # whenever AWS_REGION was unset, so local validation could hit a different
+            # region than the deployment it is validating; passing config.AWS_REGION instead
+            # would make its hardcoded us-east-1 authoritative even for a gateway elsewhere.
+            model=BedrockModel(model_id=MODEL_ID, region_name=config["region"]),
             tools=tools,
             system_prompt=SYSTEM_PROMPT,
         )
