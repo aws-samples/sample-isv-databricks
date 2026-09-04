@@ -73,7 +73,8 @@ The MCP connector type is not API-creatable (`create-action-connector` rejects `
 4. **Description** (required): `External supplier order intake API. Submits a routine purchase order or
    raises a human review ticket when no single supplier can cover demand.`
 5. **Base URL**: your Order API `ApiBaseUrl` (`https://<API_ID>.execute-api.<REGION>.amazonaws.com/prod`).
-6. **Authentication**: **None** (the demo Lambda treats the API key as optional).
+6. **Authentication**: **None** (with the default `RequireApiKey=false` the endpoint accepts
+   unauthenticated writes; deploy the stack with `RequireApiKey=true` to require the `x-api-key`).
 7. Finish. Registers two write actions: **SubmitOrder** (`POST /orders`), **CreateTicket** (`POST /tickets`).
 8. Collect the ids the flow needs:
    - Connector id: `list-action-connectors` (the `OPEN_API` row).
