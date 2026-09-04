@@ -339,3 +339,13 @@ class DomainWaitTest(unittest.TestCase):
             self.assertFalse(setup._wait_for_domain("dom-1", timeout=60))
         self.assertLessEqual(cognito.describe_user_pool_domain.call_count, 5, "retry loop is not bounded by timeout")
 
+    def test_a_non_service_error_is_not_retried(self):
+        """A fault in this call path is not a throttle. Retrying it burned the full
+        15-minute window and then reported a timeout instead of the actual error."""
+        cognito = mock.Mock(describe_user_pool_domain=mock.Mock(side_effect=TypeError("bad response shape")))
+        gs, setup = self._setup(cognito)
+        with mock.patch.object(gs.time, "sleep"):
+            self.assertFalse(setup._wait_for_domain("dom-1", timeout=900))
+        self.assertEqual(cognito.describe_user_pool_domain.call_count, 1,
+                         "a programming error must fail fast, not retry for the whole timeout")
+

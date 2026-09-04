@@ -72,7 +72,11 @@ class GatewaySetup:
                 # else -- throttling, a reset connection, a transient 5xx -- is retried,
                 # because this wait legitimately runs for minutes and a single blip used
                 # to abort the deploy and send the user to tear down a healthy domain.
-                if code in _TERMINAL_DOMAIN_ERRORS:
+                # No service error code means this is not a throttle -- it is a fault in
+                # this call path (an AttributeError on an unexpected response shape, say).
+                # Retrying that burns the entire timeout window and then reports a timeout
+                # instead of the real error, so only genuine service errors are retried.
+                if not code or code in _TERMINAL_DOMAIN_ERRORS:
                     print(f"  cannot describe Cognito domain: {exc}")
                     return False
                 # Genuinely retry: sleep, advance the ceiling, and re-poll. Falling
