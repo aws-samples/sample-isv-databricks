@@ -34,8 +34,9 @@ Notes:
   Secrets Manager secret name is still in its recovery window — either wait, or
   `aws secretsmanager delete-secret --secret-id supplier-order-api/api-key --force-delete-without-recovery`.
 - `ApiKeyValue` is **required** (no default) — the deploy command above generates a strong random
-  value with `openssl rand -hex 24`. The Lambda's `x-api-key` check is optional for the demo, so
-  auth "None" works in Quick; the key is still stored (KMS-encrypted) in Secrets Manager.
+  value with `openssl rand -hex 24`. The Lambda's `x-api-key` check is optional by default
+  (`RequireApiKey=false`), so auth "None" works in Quick; deploy with `RequireApiKey=true` to reject
+  requests that omit the key. Either way the key is stored (KMS-encrypted) in Secrets Manager.
 - The stack also creates a customer-managed **KMS key** (`alias/supplier-order-api`) that encrypts the
   Secrets Manager secret and both DynamoDB tables at rest; the tables have point-in-time recovery
   enabled. Deleting the stack schedules the key for deletion (7–30 day pending window).
@@ -69,7 +70,7 @@ Quick console → **Connectors / Actions** → **Create** → choose the **custo
 | Name | `Supplier Order API` |
 | Description | `Submit purchase orders to the supplier (routine auto-submit; exception to approval)` |
 | OpenAPI definition | upload/paste `supplier-order-api-openapi-flows.json` (server URL already baked in) |
-| Authentication | **API key** (or **None** for the demo — the Lambda key check is optional) |
+| Authentication | **API key** (or **None** for the demo — the key check is optional unless the stack is deployed with `RequireApiKey=true`) |
 | Header name | `x-api-key` |
 | Header value | (retrieve from Secrets Manager — see command above) |
 
