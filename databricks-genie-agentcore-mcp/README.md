@@ -27,6 +27,13 @@ This sample registers the [Databricks-managed Genie MCP endpoint](https://docs.d
 
 ## Prerequisites
 
+> **One deployment per AWS account.** This sample uses fixed resource names (gateway,
+> IAM role, inline policy, credential provider), which keeps the walkthrough readable but
+> means a second deployment adopts the same role name and overwrites the shared inline
+> policy, breaking the first deployment's tool calls. `deploy.py` fails loudly if it finds
+> an adopted role belonging to another region; it cannot detect a concurrent deployment in
+> the same region. Tear one down with `cleanup.py` before standing up another.
+
 1. AWS credentials configured (`aws configure`) with permissions to create AgentCore resources and IAM roles, plus **Bedrock access to a current model**. The default is the `global.anthropic.claude-sonnet-5` cross-region inference profile; override it with `MODEL_ID`. Note that current Anthropic profile ids carry no date/version suffix — `global.anthropic.claude-sonnet-5` is the whole id. Confirm what your own account can call with `aws bedrock list-inference-profiles`; Bedrock can gate an older model line on an account that has not called it recently, and that surfaces as a `ResourceNotFoundException` on your first question rather than as a model-access error.
 2. Databricks workspace on AWS with Unity Catalog enabled and at least one [Genie Space](https://docs.databricks.com/en/genie/index.html) with Trusted Assets defined
 3. Databricks service principal with an [OAuth M2M secret](https://docs.databricks.com/en/dev-tools/auth/oauth-m2m.html). The service principal needs **all three** of the following — see [Service principal permissions](#service-principal-permissions) below, as a missing grant does not surface until the first real query:

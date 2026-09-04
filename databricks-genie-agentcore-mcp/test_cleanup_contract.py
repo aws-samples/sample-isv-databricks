@@ -54,11 +54,18 @@ class FakeAgentCore:
 
 
 class FakeIam:
-    def __init__(self, policy_attached=False, policy_error=None):
+    def __init__(self, policy_attached=False, policy_error=None, policy_doc=None):
         self.calls = []
         self._policy_attached = policy_attached
         self._policy_error = policy_error
+        self._policy_doc = policy_doc
         self.exceptions = mock.Mock(NoSuchEntityException=_NoSuchEntityException)
+
+    def get_role_policy(self, RoleName, PolicyName):  # noqa: N803
+        self.calls.append(("get_role_policy", RoleName))
+        if self._policy_doc is None:
+            raise _NoSuchEntityException("no such policy")
+        return {"PolicyDocument": self._policy_doc}
 
     def delete_role_policy(self, RoleName, PolicyName):  # noqa: N803
         self.calls.append(("delete_role_policy", RoleName))
@@ -83,10 +90,11 @@ class FakeCognito:
 
 
 class ContractTest(unittest.TestCase):
-    def run_cleanup(self, state, targets=None, list_raises=False, policy_attached=False, policy_error=None):
+    def run_cleanup(self, state, targets=None, list_raises=False, policy_attached=False,
+                    policy_error=None, policy_doc=None):
         """Run cleanup.main() against a stubbed AWS and return the fakes."""
         agentcore = FakeAgentCore(targets=targets, list_raises=list_raises)
-        iam = FakeIam(policy_attached=policy_attached, policy_error=policy_error)
+        iam = FakeIam(policy_attached=policy_attached, policy_error=policy_error, policy_doc=policy_doc)
         cognito = FakeCognito()
 
         def fake_client(service, **kwargs):
@@ -184,12 +192,31 @@ class ContractTest(unittest.TestCase):
             policy_error=PermissionError("iam:DeleteRolePolicy denied"))
         self.assertTrue(state_kept, "state file was removed despite a failed policy delete")
 
-    def test_an_adopted_role_is_left_entirely_alone(self):
-        """Not even the inline policy. GATEWAY_NAME and IAM_POLICY_NAME are constants, so a
-        second deployment adopts the first one's role and shares its policy name -- deleting
-        it here strips the only OAuth/secret grant off a role a LIVE deployment is using."""
+    def test_our_own_policy_on_an_adopted_role_is_removed(self):
+        """The document names the provider recorded in state, so the grant is ours: leaving it
+        would keep GetWorkloadAccessToken and GetResourceOauth2Token on token-vault/default,
+        which cleanup never deletes, attached to a role we do not own."""
         role = "agentcore-DatabricksGenieGateway-role"
-        _, iam, _, _ = self.run_cleanup(self.state(owned_role=False), policy_attached=True)
+        doc = {"Statement": [{"Action": "bedrock-agentcore:GetResourceOauth2Token",
+                             "Resource": ["arn:aws:bedrock-agentcore:us-west-2:1:token-vault/default/oauth2credentialprovider/databricks-genie-oauth", "arn:aws:bedrock-agentcore:us-west-2:1:token-vault/default"]}]}
+        _, iam, _, _ = self.run_cleanup(self.state(owned_role=False), policy_doc=doc)
+        self.assertIn(("delete_role_policy", role), iam.calls)
+        self.assertNotIn(("delete_role", role), iam.calls)
+
+    def test_another_deployments_policy_is_not_removed(self):
+        """A different provider ARN means another deployment wrote it -- deleting it there
+        strips that deployment's only token-minting grant."""
+        role = "agentcore-DatabricksGenieGateway-role"
+        doc = {"Statement": [{"Action": "bedrock-agentcore:GetResourceOauth2Token",
+                             "Resource": ["arn:aws:bedrock-agentcore:eu-west-1:9:token-vault/default/oauth2credentialprovider/other"]}]}
+        _, iam, _, _ = self.run_cleanup(self.state(owned_role=False), policy_doc=doc)
+        self.assertNotIn(("delete_role_policy", role), iam.calls)
+        self.assertNotIn(("delete_role", role), iam.calls)
+
+    def test_an_adopted_role_with_no_policy_is_left_alone(self):
+        """No document attached, so there is nothing to decide and nothing to delete."""
+        role = "agentcore-DatabricksGenieGateway-role"
+        _, iam, _, _ = self.run_cleanup(self.state(owned_role=False), policy_doc=None)
         self.assertNotIn(("delete_role_policy", role), iam.calls)
         self.assertNotIn(("delete_role", role), iam.calls)
 
@@ -244,8 +271,6 @@ class DeployGuardTest(unittest.TestCase):
             os.remove(path)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class RoleOwnershipTest(unittest.TestCase):
@@ -428,3 +453,44 @@ class ArnGuardTest(unittest.TestCase):
     def test_a_bare_id_is_rejected(self):
         with self.assertRaises(SystemExit):
             self._resolve("my-agent")
+
+
+class AdoptedTrustPolicyTest(unittest.TestCase):
+    """An adopted role whose trust policy excludes this region must fail at deploy."""
+
+    def _setup(self, trust_doc):
+        import gateway_setup  # noqa: PLC0415
+
+        iam = mock.Mock()
+        iam.exceptions = mock.Mock(EntityAlreadyExistsException=_EntityAlreadyExistsException)
+        iam.create_role.side_effect = _EntityAlreadyExistsException("exists")
+        iam.get_role.return_value = {"Role": {"Arn": "arn:aws:iam::1:role/r",
+                                              "AssumeRolePolicyDocument": trust_doc}}
+
+        def fake_client(service, **kwargs):
+            if service == "iam":
+                return iam
+            if service == "sts":
+                return mock.Mock(get_caller_identity=mock.Mock(return_value={"Account": "1"}))
+            return mock.Mock()
+
+        with mock.patch.object(gateway_setup.boto3, "client", side_effect=fake_client):
+            return gateway_setup.GatewaySetup("us-west-2")
+
+    def test_a_role_scoped_to_another_region_fails_loudly(self):
+        doc = {"Statement": [{"Condition": {"ArnLike": {
+            "aws:SourceArn": "arn:aws:bedrock-agentcore:us-east-1:1:*"}}}]}
+        setup = self._setup(doc)
+        with self.assertRaises(SystemExit) as ctx:
+            setup.create_gateway_role("G", previously_owned=False)
+        self.assertIn("us-west-2", str(ctx.exception))
+
+    def test_a_role_scoped_to_this_region_is_accepted(self):
+        doc = {"Statement": [{"Condition": {"ArnLike": {
+            "aws:SourceArn": "arn:aws:bedrock-agentcore:us-west-2:1:*"}}}]}
+        _, owned = self._setup(doc).create_gateway_role("G", previously_owned=False)
+        self.assertFalse(owned)
+
+
+if __name__ == "__main__":
+    unittest.main()

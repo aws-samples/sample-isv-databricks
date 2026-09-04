@@ -15,7 +15,7 @@ as the AgentCore workshops in this repo.
 
 Usage:
     python build_architecture.py             # rebuild from the committed icons_b64.json cache
-    python build_architecture.py --icons /path/to/unpacked/asset-package  # refresh the cache
+    python build_architecture.py --icons /path/to/icon-root  # refresh the cache
     rsvg-convert -w 2064 architecture.svg -o architecture.png
 
 The committed icons_b64.json holds every mark as a data URI, so a clean checkout
@@ -71,7 +71,7 @@ def load_icons() -> dict:
 
     The cache short-circuit only applies when --icons was not passed explicitly.
     icons_b64.json is committed, so it always exists in a clean checkout, which made
-    the documented `--icons /path/to/asset-package` refresh a silent no-op: the user
+    the documented `--icons /path/to/icon-root` refresh a silent no-op: the user
     got "wrote architecture.svg" and the old icons.
     """
     cached = {}
@@ -99,7 +99,8 @@ def load_icons() -> dict:
                 icons[name] = cached[name]
                 continue
             raise SystemExit(
-                f"Icon not found: {path}\nPass --icons pointing at the unpacked AWS Architecture Icons asset package."
+                f"Icon not found: {path}\n--icons must point at a root holding BOTH the unpacked AWS "
+                f"Architecture Icons asset package and a databricks/ folder with the Databricks marks."
             )
         mime = "image/svg+xml" if path.endswith(".svg") else "image/png"
         with open(path, "rb") as f:

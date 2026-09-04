@@ -273,14 +273,40 @@ class GatewaySetup:
                 # Role names are global, but this trust policy scopes aws:SourceArn to
                 # self.region. Refreshing a role this sample did not create would lock
                 # another region's deployment out of assuming it, and cleanup never
-                # restores it, so an adopted role is left exactly as found.
+                # restores it, so an adopted role is left exactly as found -- and then
+                # checked, because leaving a policy that excludes this region in place
+                # only surfaces as an opaque AccessDenied at the first tool call.
                 print(f"  IAM role already exists: {role_name} (adopted, trust policy left alone)")
+                self._assert_trust_policy_allows_region(role_name)
             # Ownership must never downgrade, for the same reason as the pool above:
             # deploy #1 can create the role, record owned_role=true, then fail before the
             # gateway exists. gateway_id is still null, so rule 3 permits a re-run, and
             # that re-run finds its OWN role. Calling it adopted would make cleanup print
             # "this sample did not create it" forever, leaving the role permanently.
             return self.iam.get_role(RoleName=role_name)["Role"]["Arn"], previously_owned
+
+    def _assert_trust_policy_allows_region(self, role_name: str) -> None:
+        """Fail now if an adopted role cannot be assumed by a gateway in this region.
+
+        The trust policy this sample writes scopes aws:SourceArn to one region. An adopted
+        role from another region's deployment therefore refuses the AssumeRole, the gateway
+        and target still reach READY, and the only symptom is an opaque AccessDenied on the
+        first tool call -- long after deploy has reported success.
+        """
+        try:
+            doc = self.iam.get_role(RoleName=role_name)["Role"]["AssumeRolePolicyDocument"]
+        except Exception as exc:  # noqa: BLE001
+            print(f"  could not read the adopted role's trust policy, continuing: {exc}")
+            return
+        blob = json.dumps(doc)
+        if f"arn:aws:bedrock-agentcore:{self.region}:" in blob or "bedrock-agentcore:*:" in blob:
+            return
+        raise SystemExit(
+            f"IAM role {role_name} already exists but its trust policy does not allow "
+            f"bedrock-agentcore in {self.region}. It belongs to a deployment in another "
+            "region: this sample uses fixed resource names, so one deployment per account "
+            "is supported. Delete that deployment first, or run this one in its region."
+        )
 
     def grant_oauth_permissions(self, role_arn: str, policy_name: str, provider_arn: str, secret_arn: str) -> None:
         """Allow the gateway role to fetch the Databricks token and its secret.

@@ -43,6 +43,12 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 MODEL_ID = os.environ.get("MODEL_ID", "global.anthropic.claude-sonnet-5")
 
 # --- Resource names ---------------------------------------------------------
+# Fixed names, deliberately: they keep the walkthrough readable and cleanup unambiguous.
+# The consequence is that ONE deployment per AWS account is supported. A second deployment
+# -- in this or any other region -- adopts this role name and overwrites the shared inline
+# policy under IAM_POLICY_NAME, which breaks the first deployment's tool calls. deploy.py
+# fails loudly when it detects an adopted role from another region; it cannot detect a
+# concurrent deployment in the same region, so do not run two.
 GATEWAY_NAME = "DatabricksGenieGateway"
 TARGET_NAME = "DatabricksGenie"
 CREDENTIAL_PROVIDER_NAME = "databricks-genie-oauth"

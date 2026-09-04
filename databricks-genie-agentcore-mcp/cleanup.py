@@ -116,8 +116,10 @@ def main() -> None:
         print(f"  Credential provider   {provider_arn.rsplit('/', 1)[-1]}")
     if gateway_id:
         print(f"  Gateway               {gateway_id}")
-    if config.get("role_arn"):
+    if config.get("role_arn") and config.get("owned_role", True):
         print(f"  IAM role              {config['role_arn'].split('/')[-1]}")
+    elif config.get("role_arn"):
+        print(f"  IAM role              {config['role_arn'].split('/')[-1]}  (adopted, will NOT be deleted)")
     if pool_id and owns_pool:
         print(f"  Cognito user pool     {pool_id}")
     elif pool_id:
@@ -195,14 +197,38 @@ def main() -> None:
     # matches the old behaviour of always deleting the role.
     if role_arn and not config.get("owned_role", True):
         role_name = role_arn.split("/")[-1]
-        # An adopted role is left EXACTLY as found -- the inline policy too. GATEWAY_NAME
-        # and IAM_POLICY_NAME are constants, so a second deployment in this account adopts
-        # the first one's role and shares its policy name: deleting the policy here would
-        # strip the only GetResourceOauth2Token and secretsmanager grant off a role a LIVE
-        # deployment is still using. A stale grant left behind is recoverable; that outage
-        # is not. It points at a provider and secret this cleanup deletes, so it grants
-        # nothing once those are gone.
-        print(f"Leaving IAM role {role_name} and its inline policy in place — this sample did not create it.")
+        # The role stays (rule 2), but the inline policy is a separate question and both
+        # blanket answers are wrong. IAM_POLICY_NAME is a constant, so deleting it
+        # unconditionally can strip a LIVE deployment's only token-minting grant. Leaving it
+        # unconditionally is not harmless either: two of its three statements grant
+        # GetWorkloadAccessToken and GetResourceOauth2Token on token-vault/default and
+        # workload-identity-directory/default, which this cleanup never deletes -- so a role
+        # this sample does not own would keep account-level AgentCore token permissions.
+        # Delete it only when the attached document is OURS, identified by the credential
+        # provider ARN that grant_oauth_permissions embeds in it.
+        iam = boto3.client("iam")
+        ours = None
+        try:
+            doc = iam.get_role_policy(RoleName=role_name, PolicyName=IAM_POLICY_NAME)["PolicyDocument"]
+            ours = bool(provider_arn) and provider_arn in json.dumps(doc)
+        except iam.exceptions.NoSuchEntityException:
+            pass  # nothing attached, nothing to decide
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not read the inline policy on {role_name}: {exc}")
+            failures.append("IAM inline policy")
+        if ours:
+            try:
+                iam.delete_role_policy(RoleName=role_name, PolicyName=IAM_POLICY_NAME)
+                print(f"Removed this deployment's inline policy from adopted IAM role {role_name}.")
+            except Exception as exc:  # noqa: BLE001
+                print(f"Could not delete inline policy on {role_name}: {exc}")
+                failures.append("IAM inline policy")
+        elif ours is False:
+            print(
+                f"Leaving the inline policy on {role_name} — its document references another "
+                "deployment's credential provider, so removing it would break that deployment."
+            )
+        print(f"Leaving IAM role {role_name} in place — this sample did not create it.")
     elif role_arn:
         role_name = role_arn.split("/")[-1]
         iam = boto3.client("iam")
