@@ -281,3 +281,61 @@ class RoleOwnershipTest(unittest.TestCase):
         _, owned = self._make_setup().create_gateway_role("G", previously_owned=False)
         self.assertFalse(owned, "cleanup would delete a role belonging to something else")
 
+
+class DomainWaitTest(unittest.TestCase):
+    """The domain wait must survive a blip and still be bounded.
+
+    A transient DescribeUserPoolDomain error used to set status=None and fall into the
+    `if not status: return False` guard, so the first throttle aborted the deploy and sent
+    the user to tear down a domain that was seconds from ACTIVE. No test covered that path,
+    which is why the whole suite passed over it.
+    """
+
+    class _Boom(Exception):
+        def __init__(self, code):
+            super().__init__(code)
+            self.response = {"Error": {"Code": code}}
+
+    def _setup(self, cognito):
+        import gateway_setup  # noqa: PLC0415
+
+        def fake_client(service, **kwargs):
+            if service == "cognito-idp":
+                return cognito
+            if service == "sts":
+                return mock.Mock(get_caller_identity=mock.Mock(return_value={"Account": "1"}))
+            return mock.Mock()
+
+        with mock.patch.object(gateway_setup.boto3, "client", side_effect=fake_client):
+            return gateway_setup, gateway_setup.GatewaySetup("us-west-2")
+
+    def test_a_transient_error_is_retried_until_the_domain_is_active(self):
+        seq = [self._Boom("TooManyRequestsException"), self._Boom("InternalErrorException"),
+               {"DomainDescription": {"Status": "ACTIVE"}}]
+
+        def describe(Domain):  # noqa: N803 - boto3 casing
+            item = seq.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        gs, setup = self._setup(mock.Mock(describe_user_pool_domain=describe))
+        with mock.patch.object(gs.time, "sleep"):
+            self.assertTrue(setup._wait_for_domain("dom-1", timeout=900),
+                            "a throttle before ACTIVE must not abort the deploy")
+        self.assertEqual(seq, [], "the wait stopped polling instead of retrying")
+
+    def test_a_terminal_error_fails_fast(self):
+        cognito = mock.Mock(describe_user_pool_domain=mock.Mock(side_effect=self._Boom("AccessDeniedException")))
+        gs, setup = self._setup(cognito)
+        with mock.patch.object(gs.time, "sleep"):
+            self.assertFalse(setup._wait_for_domain("dom-1", timeout=900))
+        self.assertEqual(cognito.describe_user_pool_domain.call_count, 1, "a denied describe must not be retried")
+
+    def test_permanent_transient_errors_still_terminate(self):
+        cognito = mock.Mock(describe_user_pool_domain=mock.Mock(side_effect=self._Boom("TooManyRequestsException")))
+        gs, setup = self._setup(cognito)
+        with mock.patch.object(gs.time, "sleep"):
+            self.assertFalse(setup._wait_for_domain("dom-1", timeout=60))
+        self.assertLessEqual(cognito.describe_user_pool_domain.call_count, 5, "retry loop is not bounded by timeout")
+
