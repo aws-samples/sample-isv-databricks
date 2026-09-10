@@ -7,6 +7,9 @@ gateway_config.json*
 # Written by `agentcore configure` / `agentcore deploy` — runtime/agent ARNs, ECR uri.
 .bedrock_agentcore.yaml
 
+# Build/staging artifacts written by the `agentcore` CLI.
+.bedrock_agentcore/
+
 # Local secrets
 .env
 

@@ -44,9 +44,31 @@ This sample registers the [Databricks-managed Genie MCP endpoint](https://docs.d
 
 ### Service principal permissions
 
-Grant all three before running `deploy.py`. The warehouse grant is easy to miss: `tools/list`
-succeeds without it and the gateway target still reaches `READY`, so the integration looks
-healthy right up until the first query fails.
+Grant all three before running `deploy.py`. They fail at two different stages, so watch for
+both:
+
+- **Genie space `CAN_RUN`** is needed just to read the space. Without it `deploy.py` cannot
+  register the target at all — the target ends in **`FAILED`** (not `READY`) with
+  `PERMISSION_DENIED: ... does not have read permission` on the space.
+- **Warehouse `CAN_USE`** and **UC `SELECT`** are easy to miss: `tools/list` succeeds without
+  them and the target still reaches `READY`, so the integration looks healthy right up until
+  the first real query fails.
+
+You can grant these two ways — the Databricks UI or the CLI. In either, identify the service
+principal by its **application ID** (the `DATABRICKS_CLIENT_ID` value).
+
+#### Option A — Databricks UI
+
+1. **Genie space** — open the space (**Genie** in the left nav), **Share**, add the service
+   principal, set **Can run**, **Save**.
+2. **SQL warehouse** — the space runs on one assigned warehouse (space → **Settings** →
+   **SQL warehouse**). Under **SQL Warehouses**, open it → **Permissions** → add the service
+   principal with **Can use**.
+3. **Unity Catalog objects** — in **Catalog**, open the catalog → **Permissions** → **Grant**
+   `USE CATALOG`; then open each schema the space reads → **Grant** `USE SCHEMA` and `SELECT`
+   (schema-level `SELECT` covers all its tables).
+
+#### Option B — Databricks CLI
 
 Find the warehouse backing your Genie space:
 
@@ -72,12 +94,13 @@ databricks api patch /api/2.1/unity-catalog/permissions/schema/$CATALOG.$SCHEMA 
   --json '{"changes":[{"principal":"'$SP_APP_ID'","add":["USE_SCHEMA","SELECT"]}]}'
 ```
 
-Symptoms of each missing grant, as returned inside the Genie message payload:
+Symptoms of each missing grant:
 
-| Missing grant | Error |
-|---|---|
-| Warehouse `CAN_USE` | `PERMISSION_DENIED: <sp-id> is not authorized to use or monitor this SQL Endpoint` |
-| UC `SELECT` / `USE SCHEMA` | `PERMISSION_DENIED: No access to '<catalog>.<schema>.<table>' … you must have SELECT on each data asset` |
+| Missing grant | When it surfaces | Error |
+|---|---|---|
+| Genie space `CAN_RUN` | `deploy.py` — target ends in `FAILED` | `PERMISSION_DENIED: ... <sp-id> does not have read permission` on the space |
+| Warehouse `CAN_USE` | first query, in the Genie message payload | `PERMISSION_DENIED: <sp-id> is not authorized to use or monitor this SQL Endpoint` |
+| UC `SELECT` / `USE SCHEMA` | first query, in the Genie message payload | `PERMISSION_DENIED: No access to '<catalog>.<schema>.<table>' … you must have SELECT on each data asset` |
 
 ## Configuration
 
@@ -91,6 +114,24 @@ export DATABRICKS_CLIENT_ID="<service principal application ID>"
 export DATABRICKS_CLIENT_SECRET="<OAuth M2M secret>"
 export GENIE_SPACE_ID="<Genie space ID, from the space URL>"
 export AWS_REGION="us-east-1"          # optional, defaults to us-east-1
+```
+
+### Pointing at a Genie space
+
+**Find the space ID.** Open the space under **Genie** in the left nav; the ID is the last
+path segment of the space URL (`.../genie/rooms/<space-id>`). Use it as `GENIE_SPACE_ID`. The
+[service-principal grants](#service-principal-permissions) above are per-space — they do not
+carry over from another space.
+
+**Switching an already-deployed gateway to a different space.** The space ID is baked into the
+gateway target's MCP endpoint (`/api/2.0/mcp/genie/{space_id}`), so changing `GENIE_SPACE_ID`
+alone has no effect on a running gateway — the target must be re-registered. With the scripts
+here, tear down and redeploy:
+
+```bash
+python cleanup.py                     # remove the old target (and gateway stack)
+export GENIE_SPACE_ID="<new space ID>"
+python deploy.py                      # register a target for the new space
 ```
 
 ## Files
