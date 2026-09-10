@@ -145,6 +145,7 @@ python deploy.py                      # register a target for the new space
 | `genie_agent.py` | The agent entrypoint hosted on **AgentCore Runtime** (`BedrockAgentCoreApp`). Deployed with the `agentcore` CLI, not run directly. |
 | `invoke_runtime.py` | Invokes the deployed Runtime agent via `invoke_agent_runtime`. |
 | `cleanup.py` | Deletes the target, credential provider, gateway, IAM role and Cognito user pool. |
+| `generate_data.py` | Loads a tiny Unity Catalog dataset (`products`, `sales`) via the SQL Statement Execution API so a fresh Genie space can answer the sample questions. Optional. |
 
 ## Getting Started
 
@@ -182,7 +183,36 @@ python deploy.py
 6. **Save configuration** — writes `gateway_config.json` (gateway id and URL, target
    id, provider ARN, Cognito client info) for the other scripts to read.
 
-### 2. Verify locally
+### 2. Load a sample dataset (optional)
+
+The sample's questions (e.g. *"What were our top 5 products by revenue last quarter?"*)
+only return answers if the Genie space is backed by data. If you don't already have a
+populated space, `generate_data.py` creates a tiny Unity Catalog dataset — one catalog,
+one schema, two small tables (`products` and `sales`, a few hundred rows spanning ~18
+months) — enough to answer the questions this sample ships with:
+
+```bash
+python generate_data.py           # create + load catalog `genie_demo`, schema `sales`
+python generate_data.py --drop    # drop the schema first, then recreate
+```
+
+It runs over the [SQL Statement Execution API](https://docs.databricks.com/en/dev-tools/sql-execution-tutorial.html)
+as the same OAuth2 M2M service principal (no extra dependencies, no PAT) and auto-resolves
+the SQL warehouse behind `GENIE_SPACE_ID` (or set `DATABRICKS_WAREHOUSE_ID`). The target
+catalog/schema default to `genie_demo` / `sales` (override with `DATABRICKS_CATALOG` /
+`DATABRICKS_SCHEMA`).
+
+> **The service principal must be able to create the objects.** A least-privilege *query*
+> SP usually cannot `CREATE CATALOG` / `CREATE SCHEMA`, so either run this step as a
+> workspace/metastore admin, grant the SP those privileges, or point `DATABRICKS_CATALOG`
+> at an existing catalog where the SP can `CREATE SCHEMA` (the script skips `CREATE CATALOG`
+> when the catalog already exists).
+
+Then, in the Genie UI, add `<catalog>.<schema>.products` and `<catalog>.<schema>.sales` to
+your space as data assets, and confirm the SP has the space / warehouse / Unity Catalog
+grants from [Service principal permissions](#service-principal-permissions).
+
+### 3. Verify locally
 
 ```bash
 python invoke.py --list-tools                 # confirm the tool surface
@@ -199,7 +229,7 @@ deployment problems.
 > the first query cold-starts it and can take a couple of minutes. That is the warehouse
 > starting, not a broken integration.
 
-### 3. Deploy to AgentCore Runtime
+### 4. Deploy to AgentCore Runtime
 
 > **The `agentcore` CLI used below is deprecated.** These commands come from
 > `bedrock-agentcore-starter-toolkit`, which is deliberately **not** in
@@ -243,14 +273,14 @@ token left every request after expiry failing with a 401.
 > region as the gateway**, otherwise it cannot reach the gateway endpoint. Verify the
 > `region:` value in the generated `.bedrock_agentcore.yaml` before deploying.
 
-### 4. Validate governance
+### 5. Validate governance
 
 Unity Catalog audit logs record the SQL executed by the service principal, and AgentCore
 Runtime and Gateway emit CloudWatch traces for each tool invocation. Check both to confirm
 what actually ran and under whose identity — this is the step that tells you whether the
 governance story holds in your own workspace.
 
-### 5. Clean up
+### 6. Clean up
 
 ```bash
 agentcore destroy      # remove the deployed Runtime agent
