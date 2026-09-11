@@ -10,6 +10,10 @@ gateway_config.json*
 # Build/staging artifacts written by the `agentcore` CLI.
 .bedrock_agentcore/
 
+# Written by generate_data.py — records the sample dataset it created so --drop
+# only removes objects this sample made. No secrets, but local state.
+seed_state.json
+
 # Local secrets
 .env
 

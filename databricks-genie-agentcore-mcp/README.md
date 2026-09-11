@@ -192,21 +192,36 @@ one schema, two small tables (`products` and `sales`, a few hundred rows spannin
 months) — enough to answer the questions this sample ships with:
 
 ```bash
-python generate_data.py           # create + load catalog `genie_demo`, schema `sales`
-python generate_data.py --drop    # drop the schema first, then recreate
+python generate_data.py                 # create + load catalog `genie_demo`, schema `sales`
+python generate_data.py --drop          # drop what this script created, then recreate
+python generate_data.py --drop --yes    # ... skipping the confirmation prompt
 ```
 
 It runs over the [SQL Statement Execution API](https://docs.databricks.com/en/dev-tools/sql-execution-tutorial.html)
-as the same OAuth2 M2M service principal (no extra dependencies, no PAT) and auto-resolves
-the SQL warehouse behind `GENIE_SPACE_ID` (or set `DATABRICKS_WAREHOUSE_ID`). The target
-catalog/schema default to `genie_demo` / `sales` (override with `DATABRICKS_CATALOG` /
-`DATABRICKS_SCHEMA`).
+(no extra dependencies, no PAT) and auto-resolves the SQL warehouse behind `GENIE_SPACE_ID`
+(or set `DATABRICKS_WAREHOUSE_ID`). The target catalog/schema default to `genie_demo` /
+`sales` (override with `DATABRICKS_CATALOG` / `DATABRICKS_SCHEMA`).
 
-> **The service principal must be able to create the objects.** A least-privilege *query*
-> SP usually cannot `CREATE CATALOG` / `CREATE SCHEMA`, so either run this step as a
-> workspace/metastore admin, grant the SP those privileges, or point `DATABRICKS_CATALOG`
-> at an existing catalog where the SP can `CREATE SCHEMA` (the script skips `CREATE CATALOG`
-> when the catalog already exists).
+> **Use a separate identity for the DDL — do not reuse the gateway's service principal as
+> an admin.** Creating a catalog/schema/tables needs privileges the least-privilege *query*
+> service principal usually lacks. Set a distinct seeding identity and the script runs its
+> DDL as that identity, then grants the query SP read access:
+>
+> ```bash
+> export DATABRICKS_SEED_CLIENT_ID="<app ID of an SP that can CREATE CATALOG/SCHEMA>"
+> export DATABRICKS_SEED_CLIENT_SECRET="<its OAuth M2M secret>"
+> ```
+>
+> This matters because `deploy.py` writes `DATABRICKS_CLIENT_ID`/`DATABRICKS_CLIENT_SECRET`
+> into the gateway's outbound credential provider — its identity to Databricks. Editing
+> those to an admin's, even briefly, silently makes the *gateway* run as that admin and
+> breaks the governance story this sample demonstrates. If `DATABRICKS_SEED_*` is unset the
+> script falls back to the query SP (fine only when it already owns the target catalog).
+
+**Safety.** The script refuses to modify `products`/`sales` tables it didn't create, and
+`--drop` only removes a schema it recorded creating (tracked in the gitignored
+`seed_state.json`) and prompts first. It is also the teardown for the sample data —
+`cleanup.py` removes only AWS resources, not these Unity Catalog objects.
 
 Then, in the Genie UI, add `<catalog>.<schema>.products` and `<catalog>.<schema>.sales` to
 your space as data assets, and confirm the SP has the space / warehouse / Unity Catalog
