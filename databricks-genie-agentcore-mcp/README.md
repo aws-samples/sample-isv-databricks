@@ -223,9 +223,44 @@ It runs over the [SQL Statement Execution API](https://docs.databricks.com/en/de
 `seed_state.json`) and prompts first. It is also the teardown for the sample data —
 `cleanup.py` removes only AWS resources, not these Unity Catalog objects.
 
-Then, in the Genie UI, add `<catalog>.<schema>.products` and `<catalog>.<schema>.sales` to
-your space as data assets, and confirm the SP has the space / warehouse / Unity Catalog
-grants from [Service principal permissions](#service-principal-permissions).
+Then add the two tables to your Genie space as data assets — this is a manual step in the
+Databricks UI:
+
+1. Open your space (**Genie** in the left nav) → **Settings** (or the **Data** / **+ Add**
+   panel, depending on your workspace version).
+2. Add `<catalog>.<schema>.products` and `<catalog>.<schema>.sales` as data assets (with the
+   defaults above, `genie_demo.sales.products` and `genie_demo.sales.sales`).
+3. **Save** the space.
+
+Then confirm the SP has the space / warehouse / Unity Catalog grants from
+[Service principal permissions](#service-principal-permissions).
+
+> **"You don't have SELECT access" warning when adding a table — safe to ignore.** When
+> `generate_data.py` seeds the data as the query service principal (the default when
+> `DATABRICKS_SEED_*` is unset), the SP *owns* the resulting schema, so it can read the tables
+> at runtime. But **you**, the human adding assets in the UI, are a different identity, and the
+> SP-owned schema isn't granted to your personal login — so the UI shows:
+>
+> ```
+> Warning: You don't have SELECT access on 'workspace.sales.products'.
+> ```
+>
+> This is about your UI preview identity, **not** the runtime path. Add the asset past the
+> warning and proceed — Genie queries run as the SP (M2M), and the SP owns the tables, so the
+> end-to-end flow works regardless. This was verified end-to-end: `invoke.py` and
+> `invoke_runtime.py` both returned the seeded products despite the UI warning.
+>
+> To clear the warning so you can also preview data in the UI, grant your own login (run as an
+> admin in a SQL editor, substituting your Databricks login email and the catalog/schema you
+> seeded):
+>
+> ```sql
+> GRANT USE CATALOG ON CATALOG <catalog>            TO `<your-databricks-login-email>`;
+> GRANT USE SCHEMA  ON SCHEMA  <catalog>.<schema>   TO `<your-databricks-login-email>`;
+> GRANT SELECT      ON SCHEMA  <catalog>.<schema>   TO `<your-databricks-login-email>`;
+> ```
+>
+> (Schema-level `SELECT` covers both `products` and `sales`.)
 
 ### 3. Verify locally
 
