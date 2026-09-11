@@ -1,7 +1,7 @@
 """Populate a tiny sample lakehouse so a Genie space can answer the demo questions.
 
 Creates one catalog / one schema / two small tables (`products` and `sales`) in
-Unity Catalog and seeds them with a few hundred rows — just enough to answer the
+Unity Catalog and seeds them with ~1,400 rows — just enough to answer the
 questions this sample ships with, e.g.:
 
     python invoke.py "What were our top 5 products by revenue last quarter?"
@@ -37,7 +37,8 @@ Usage:
 
 Requires:
     DATABRICKS_HOST, DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET
-    and exactly one of DATABRICKS_WAREHOUSE_ID or GENIE_SPACE_ID (to pick a warehouse)
+    and at least one of DATABRICKS_WAREHOUSE_ID or GENIE_SPACE_ID (to pick a warehouse;
+    DATABRICKS_WAREHOUSE_ID wins if both are set)
 Optional:
     DATABRICKS_SEED_CLIENT_ID / DATABRICKS_SEED_CLIENT_SECRET  (separate DDL identity)
     DATABRICKS_CATALOG   (default: genie_demo)

@@ -188,7 +188,7 @@ python deploy.py
 The sample's questions (e.g. *"What were our top 5 products by revenue last quarter?"*)
 only return answers if the Genie space is backed by data. If you don't already have a
 populated space, `generate_data.py` creates a tiny Unity Catalog dataset — one catalog,
-one schema, two small tables (`products` and `sales`, a few hundred rows spanning ~18
+one schema, two small tables (`products` and `sales`, ~1,400 rows spanning ~18
 months) — enough to answer the questions this sample ships with:
 
 ```bash
@@ -242,7 +242,7 @@ Then confirm the SP has the space / warehouse / Unity Catalog grants from
 > SP-owned schema isn't granted to your personal login — so the UI shows:
 >
 > ```
-> Warning: You don't have SELECT access on 'workspace.sales.products'.
+> Warning: You don't have SELECT access on 'genie_demo.sales.products'.
 > ```
 >
 > This is about your UI preview identity, **not** the runtime path. Add the asset past the
