@@ -23,6 +23,8 @@ from config import (
     DATABRICKS_CLIENT_ID,
     DATABRICKS_CLIENT_SECRET,
     DATABRICKS_HOST,
+    DATABRICKS_SECRET_ARN,
+    DATABRICKS_SECRET_JSON_KEY,
     GATEWAY_NAME,
     GENIE_SPACE_ID,
     IAM_POLICY_NAME,
@@ -127,6 +129,31 @@ def create_gateway(setup: GatewaySetup, persist, prior_state=None) -> dict:
     return state
 
 
+def client_secret_config() -> dict:
+    """Return the clientSecret* fragment of the provider config for the active secret source.
+
+    Two mutually exclusive shapes the API accepts under customOauth2ProviderConfig:
+
+    - MANAGED (default): pass the plaintext `clientSecret`. AgentCore stores it in a
+      Secrets Manager secret it creates and owns, and returns that ARN.
+    - EXTERNAL: pass `clientSecretSource="EXTERNAL"` + `clientSecretConfig` referencing a
+      Secrets Manager secret you already provisioned (see secrets_setup.py). The plaintext
+      never passes through deploy.py or lives in .env. AgentCore references the secret;
+      it does not own or delete it.
+
+    Selected by DATABRICKS_SECRET_ARN: set -> EXTERNAL, unset -> MANAGED.
+    """
+    if DATABRICKS_SECRET_ARN:
+        return {
+            "clientSecretSource": "EXTERNAL",
+            "clientSecretConfig": {
+                "secretId": DATABRICKS_SECRET_ARN,
+                "jsonKey": DATABRICKS_SECRET_JSON_KEY,
+            },
+        }
+    return {"clientSecret": DATABRICKS_CLIENT_SECRET}
+
+
 def create_credential_provider(agentcore) -> tuple:
     """Register Databricks OAuth2 client-credentials as an outbound provider."""
     token_endpoint = f"{DATABRICKS_HOST}/oidc/v1/token"
@@ -136,7 +163,10 @@ def create_credential_provider(agentcore) -> tuple:
     # the authorization-code path the README points readers toward.
     authorization_endpoint = f"{DATABRICKS_HOST}/oidc/v1/authorize"
 
-    print("Creating Databricks OAuth2 credential provider...")
+    if DATABRICKS_SECRET_ARN:
+        print(f"Creating Databricks OAuth2 credential provider (secret from {DATABRICKS_SECRET_ARN})...")
+    else:
+        print("Creating Databricks OAuth2 credential provider (secret managed by AgentCore)...")
     # Deliberately no pre-emptive delete here. A live target holds a
     # credentialProviderConfigurations reference to this provider, so removing it would
     # break a working deployment before anything is recreated -- and the name is shared
@@ -155,15 +185,22 @@ def create_credential_provider(agentcore) -> tuple:
                     }
                 },
                 "clientId": DATABRICKS_CLIENT_ID,
-                "clientSecret": DATABRICKS_CLIENT_SECRET,
+                **client_secret_config(),
             }
         },
     )
     provider_arn = provider["credentialProviderArn"]
-    _client_secret = provider.get("clientSecretArn")
-    if isinstance(_client_secret, dict):
-        _client_secret = _client_secret.get("secretArn", "")
-    secret_arn = provider.get("secretArn") or _client_secret or ""
+    # In EXTERNAL mode we provisioned the secret ourselves, so its ARN is authoritative --
+    # scope the step-4 grant to it directly rather than trusting the response shape. In
+    # MANAGED mode AgentCore owns the secret and only the response reveals its ARN, so probe
+    # the two known keys there.
+    if DATABRICKS_SECRET_ARN:
+        secret_arn = DATABRICKS_SECRET_ARN
+    else:
+        _client_secret = provider.get("clientSecretArn")
+        if isinstance(_client_secret, dict):
+            _client_secret = _client_secret.get("secretArn", "")
+        secret_arn = provider.get("secretArn") or _client_secret or ""
     if not secret_arn:
         # The response shape isn't stable, so we probe two known keys above; if
         # both miss we get "". Fail loudly here: an empty ARN would drop the

@@ -30,6 +30,20 @@ DATABRICKS_CLIENT_ID = os.environ.get("DATABRICKS_CLIENT_ID", "")
 DATABRICKS_CLIENT_SECRET = os.environ.get("DATABRICKS_CLIENT_SECRET", "")
 GENIE_SPACE_ID = os.environ.get("GENIE_SPACE_ID", "")
 
+# Optional production path for the OAuth M2M secret. When DATABRICKS_SECRET_ARN is set,
+# deploy.py registers the credential provider with clientSecretSource="EXTERNAL" and points
+# it at this Secrets Manager secret (see secrets_setup.py) instead of passing the plaintext
+# DATABRICKS_CLIENT_SECRET inline. The secret is a JSON document; DATABRICKS_SECRET_JSON_KEY
+# names the key that holds the client secret value. With the ARN set, DATABRICKS_CLIENT_SECRET
+# is not needed for deploy.py -- the plaintext never has to live in .env or the shell.
+DATABRICKS_SECRET_ARN = os.environ.get("DATABRICKS_SECRET_ARN", "")
+DATABRICKS_SECRET_JSON_KEY = os.environ.get("DATABRICKS_SECRET_JSON_KEY", "client_secret")
+# Name of the Secrets Manager secret that secrets_setup.py creates/updates. Only used by
+# secrets_setup.py; deploy.py references the secret by ARN via DATABRICKS_SECRET_ARN.
+DATABRICKS_SECRET_NAME = os.environ.get(
+    "DATABRICKS_SECRET_NAME", "databricks-genie-agentcore/oauth-client-secret"
+)
+
 # Used only by generate_data.py to load the sample dataset. The warehouse is
 # optional: if unset, generate_data.py resolves the one backing GENIE_SPACE_ID.
 DATABRICKS_WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
@@ -86,11 +100,15 @@ def require_databricks_config() -> None:
         for name, value in (
             ("DATABRICKS_HOST", DATABRICKS_HOST),
             ("DATABRICKS_CLIENT_ID", DATABRICKS_CLIENT_ID),
-            ("DATABRICKS_CLIENT_SECRET", DATABRICKS_CLIENT_SECRET),
             ("GENIE_SPACE_ID", GENIE_SPACE_ID),
         )
         if not value
     ]
+    # The OAuth secret may come from either the plaintext env var or a Secrets Manager
+    # reference (DATABRICKS_SECRET_ARN, the production path). Require exactly one to be
+    # present -- neither is a hard error; both is fine (the ARN wins in deploy.py).
+    if not DATABRICKS_CLIENT_SECRET and not DATABRICKS_SECRET_ARN:
+        missing.append("DATABRICKS_CLIENT_SECRET or DATABRICKS_SECRET_ARN")
     if missing:
         raise SystemExit(
             "Missing required environment variable(s): "

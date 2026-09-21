@@ -14,6 +14,11 @@ gateway_config.json*
 # only removes objects this sample made. No secrets, but local state.
 seed_state.json
 
+# Written by secrets_setup.py — records the Secrets Manager secret it created (ARN + a
+# created flag) so --delete only removes a secret this script made. No secret value, but
+# local state.
+secret_state.json
+
 # Local secrets
 .env
 
