@@ -400,6 +400,27 @@ class SecretsSetupTest(unittest.TestCase):
         self.assertNotIn("create_secret", client._kinds())
         self.assertFalse(self._state["created"])  # pre-existing: we won't --delete it
 
+    def test_custom_json_key_flows_through_both_sides(self):
+        # The key secrets_setup.py writes into the secret JSON and the key deploy.py hands
+        # the provider in clientSecretConfig.jsonKey must be the SAME key, or the provider
+        # reads a field that isn't there and every tool call 403s after READY. Exercise a
+        # NON-default key so a hardcoded "client_secret" on either side is caught.
+        custom = "db_oauth_secret"
+        client = _FakeSecretsManager()
+        self._patch(secrets_setup, "DATABRICKS_CLIENT_SECRET", "s3cr3t")
+        self._run(secrets_setup.provision, client, self._NAME, custom)
+        stored = next(c[2] for c in client.calls if c[0] == "create_secret")
+        self.assertEqual(json.loads(stored), {custom: "s3cr3t"})  # secrets_setup writes it
+
+        arn = self._state["secret_arn"]
+        with mock.patch.multiple(
+            deploy, DATABRICKS_SECRET_ARN=arn, DATABRICKS_SECRET_JSON_KEY=custom
+        ):
+            cfg = deploy.client_secret_config()
+        self.assertEqual(cfg["clientSecretConfig"]["jsonKey"], custom)  # deploy references it
+        # And the two sides agree on the key -- the whole point of the check.
+        self.assertEqual(json.loads(stored).get(cfg["clientSecretConfig"]["jsonKey"]), "s3cr3t")
+
     def test_provision_aborts_without_plaintext(self):
         self._patch(secrets_setup, "DATABRICKS_CLIENT_SECRET", "")
         with self.assertRaises(SystemExit) as ctx:

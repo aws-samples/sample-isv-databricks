@@ -164,9 +164,11 @@ Notes:
   AWS gateway resources and, in EXTERNAL mode, does **not** delete your secret. Tear it down
   with `python secrets_setup.py --delete` (30-day recovery window by default; `--force` to
   delete immediately).
-- **Encryption.** AgentCore Identity reads the secret with the account's default Secrets
-  Manager encryption. If you encrypt it with a customer-managed KMS key instead, also grant
-  the AgentCore service principal `kms:Decrypt` on that key.
+- **Encryption.** This sample grants the **gateway role** the `secretsmanager:GetSecretValue`
+  read (step 4), scoped to the external secret's ARN — the same role and grant it uses in the
+  default managed path. If you encrypt the secret with a customer-managed KMS key, that role
+  also needs `kms:Decrypt` on the key; the default AWS-managed Secrets Manager key needs no
+  extra grant. (The CMK case is not exercised by this sample.)
 - **Seeding vs. gateway.** This is independent of `generate_data.py`, which still uses
   `DATABRICKS_CLIENT_SECRET` directly for its one-time DDL.
 
