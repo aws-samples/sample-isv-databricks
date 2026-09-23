@@ -164,11 +164,23 @@ Notes:
   AWS gateway resources and, in EXTERNAL mode, does **not** delete your secret. Tear it down
   with `python secrets_setup.py --delete` (30-day recovery window by default; `--force` to
   delete immediately).
-- **Encryption.** This sample grants the **gateway role** the `secretsmanager:GetSecretValue`
-  read (step 4), scoped to the external secret's ARN — the same role and grant it uses in the
-  default managed path. If you encrypt the secret with a customer-managed KMS key, that role
-  also needs `kms:Decrypt` on the key; the default AWS-managed Secrets Manager key needs no
-  extra grant. (The CMK case is not exercised by this sample.)
+- **Who reads the secret.** Two different principals do, at two different times. AgentCore
+  makes both reads on a principal's behalf, so both appear in CloudTrail as that principal
+  with `invokedBy: bedrock-agentcore.amazonaws.com`:
+  - **At deploy time** — `CreateOauth2CredentialProvider`, `CreateGatewayTarget` and
+    `SynchronizeGatewayTargets` each read the secret as **the principal running `deploy.py`**.
+    Your own credentials therefore need `secretsmanager:GetSecretValue` on this secret.
+    Nothing in this sample grants that, and on an administrator principal you will never
+    notice it was required.
+  - **On token refresh** — the Databricks token is cached for its lifetime (~1 hour), so no
+    read happens during that window. When it expires, the refresh reads the secret as the
+    **gateway execution role**. That is the grant `deploy.py` attaches in step 4, scoped to
+    this ARN. Omit it and tool calls succeed for about an hour, then start failing.
+
+  Both are same-account principals, so a Secrets Manager **resource policy is not required**.
+- **Encryption.** The default AWS-managed Secrets Manager key needs no extra grant. If you
+  encrypt the secret with a customer-managed KMS key, **both** principals above need
+  `kms:Decrypt` on that key. (The CMK case is not exercised by this sample.)
 - **Seeding vs. gateway.** This is independent of `generate_data.py`, which still uses
   `DATABRICKS_CLIENT_SECRET` directly for its one-time DDL.
 
