@@ -18,9 +18,15 @@ deploy.py then registers the credential provider with clientSecretSource="EXTERN
 scopes the gateway role's secretsmanager:GetSecretValue to exactly this ARN.
 
 The secret is a JSON document so it can hold more than one field later; DATABRICKS_SECRET_JSON_KEY
-(default "client_secret") names the key that holds the value. AgentCore Identity reads it with
-the account's default Secrets Manager encryption. If you encrypt it with a customer-managed KMS
-key instead, also grant the AgentCore service principal kms:Decrypt on that key.
+(default "client_secret") names the key that holds the value.
+
+Two principals read this secret, and AgentCore makes both reads on a principal's behalf rather
+than as itself: the principal running deploy.py reads it at deploy time, and the gateway
+execution role reads it when the cached Databricks token expires (~1 hour). See "Who reads the
+secret" in README.md. The secret is expected to live in the same account as the gateway, so no
+Secrets Manager resource policy is needed. With the account's default Secrets Manager
+encryption there is nothing further to grant; if you encrypt it with a customer-managed KMS key
+instead, BOTH principals above need kms:Decrypt on that key.
 
 Usage:
     python secrets_setup.py               # create or update the secret, print its ARN

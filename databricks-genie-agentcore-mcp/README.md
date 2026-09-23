@@ -177,7 +177,10 @@ Notes:
     **gateway execution role**. That is the grant `deploy.py` attaches in step 4, scoped to
     this ARN. Omit it and tool calls succeed for about an hour, then start failing.
 
-  Both are same-account principals, so a Secrets Manager **resource policy is not required**.
+  This walkthrough assumes the secret lives in **the same account as the gateway**. Both
+  principals above are then same-account, so a Secrets Manager **resource policy is not
+  required**. Putting the secret in a different account is a different problem — it needs a
+  resource policy and a CMK grant naming the reading principals — and is not covered here.
 - **Encryption.** The default AWS-managed Secrets Manager key needs no extra grant. If you
   encrypt the secret with a customer-managed KMS key, **both** principals above need
   `kms:Decrypt` on that key. (The CMK case is not exercised by this sample.)
