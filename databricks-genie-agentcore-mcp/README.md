@@ -158,6 +158,11 @@ ARN — the same least-privilege grant, now pointed at a secret you own and rota
 is a JSON document; `DATABRICKS_SECRET_JSON_KEY` (default `client_secret`) names the key that
 holds the value.
 
+If you set a **non-default** `DATABRICKS_SECRET_JSON_KEY`, export it in the `deploy.py` shell
+too (the block above exports only the ARN). The key must match on both sides or the provider
+reads a field that isn't there; `deploy.py` reads the key `secrets_setup.py` recorded and aborts
+on a mismatch before building anything, rather than letting it surface as a 403 an hour later.
+
 Notes:
 
 - **Lifecycle.** `secrets_setup.py` owns the secret it creates. `cleanup.py` removes only the

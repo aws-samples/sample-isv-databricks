@@ -92,39 +92,83 @@ def confirm(action: str, assume_yes: bool) -> None:
         raise SystemExit("Aborted.")
 
 
-def find_secret_arn(client, name: str) -> str | None:
-    """Return the ARN of the secret with this name, or None if it does not exist."""
+def describe_secret(client, name: str) -> dict | None:
+    """Return the describe_secret response for this name, or None if it does not exist."""
     try:
-        return client.describe_secret(SecretId=name)["ARN"]
+        return client.describe_secret(SecretId=name)
     except client.exceptions.ResourceNotFoundException:
         return None
 
 
+def find_secret_arn(client, name: str) -> str | None:
+    """Return the ARN of the secret with this name, or None if it does not exist."""
+    desc = describe_secret(client, name)
+    return desc["ARN"] if desc else None
+
+
+def existing_document(client, name: str) -> dict:
+    """The current secret value as a dict, so provision() can MERGE rather than clobber.
+
+    A non-JSON or non-object value is ambiguous to merge into, so refuse rather than
+    overwrite a secret we may not own.
+    """
+    current = client.get_secret_value(SecretId=name).get("SecretString")
+    if not current:
+        return {}
+    try:
+        document = json.loads(current)
+    except json.JSONDecodeError:
+        raise SystemExit(
+            f"Secret {name} exists but its value is not JSON. secrets_setup.py stores a JSON "
+            "document and will not overwrite a plain-string secret you may rely on elsewhere. "
+            "Point DATABRICKS_SECRET_NAME at a different name, or convert the secret yourself."
+        )
+    if not isinstance(document, dict):
+        raise SystemExit(
+            f"Secret {name} exists but its JSON value is not an object; refusing to overwrite it. "
+            "Point DATABRICKS_SECRET_NAME at a different name."
+        )
+    return document
+
+
 def provision(client, name: str, json_key: str) -> str:
-    """Create the secret, or update its value if it already exists. Return the ARN."""
+    """Create the secret, or merge our key into it if it already exists. Return the ARN."""
     if not DATABRICKS_CLIENT_SECRET:
         raise SystemExit(
             "DATABRICKS_CLIENT_SECRET is not set. Set it to the Databricks OAuth M2M secret "
             "so this script can store it in Secrets Manager, then re-run."
         )
-    secret_string = build_secret_string(DATABRICKS_CLIENT_SECRET, json_key)
 
-    existing_arn = find_secret_arn(client, name)
-    if existing_arn:
-        # Adopt an existing secret by rotating its value in place. Preserve a prior
-        # created=True so a create-then-update sequence still lets us --delete it.
-        client.put_secret_value(SecretId=name, SecretString=secret_string)
+    desc = describe_secret(client, name)
+    if desc:
+        if desc.get("DeletedDate"):
+            # describe_secret still resolves a secret inside its deletion recovery window, so
+            # the adopt branch below would take it and put_secret_value would raise. Say what
+            # to do instead of crashing -- this is the README's own --delete then re-run path.
+            raise SystemExit(
+                f"Secret {name} is scheduled for deletion (in its recovery window). Restore it "
+                f"before re-running:\n  aws secretsmanager restore-secret --secret-id {name}\n"
+                "or wait for deletion to complete, then create a fresh one."
+            )
+        existing_arn = desc["ARN"]
+        # Adopt in place by MERGING our key into the existing document, so any sibling keys on
+        # a secret we did not create survive (the module docstring promises this). Preserve a
+        # prior created=True so a create-then-update sequence still lets us --delete it.
         prior = read_secret_state()
         created = bool(prior.get("created")) and prior.get("secret_arn") == existing_arn
-        arn = existing_arn
-        print(f"  Updated existing secret {name}")
         if not created:
-            print("  (secret pre-existed; this script did not create it and will not --delete it)")
+            print(f"  Adopting existing secret {name} (this script did not create it and will not --delete it)")
+        document = existing_document(client, name)
+        others = len(document) - (1 if json_key in document else 0)
+        document[json_key] = DATABRICKS_CLIENT_SECRET
+        client.put_secret_value(SecretId=name, SecretString=json.dumps(document))
+        arn = existing_arn
+        print(f"  Updated secret {name}: set key '{json_key}', preserved {others} other field(s)")
     else:
         resp = client.create_secret(
             Name=name,
             Description="Databricks Genie OAuth M2M client secret for the AgentCore gateway",
-            SecretString=secret_string,
+            SecretString=build_secret_string(DATABRICKS_CLIENT_SECRET, json_key),
         )
         arn = resp["ARN"]
         created = True
@@ -140,7 +184,11 @@ def delete(client, name: str, force: bool, assume_yes: bool) -> None:
     arn = find_secret_arn(client, name)
     if not arn:
         print(f"Nothing to delete: secret {name} does not exist.")
-        clear_secret_state()
+        # Only clear the ownership record if it actually refers to THIS name. Running
+        # --delete with a different DATABRICKS_SECRET_NAME must not wipe the record for
+        # the secret the script really created, leaving it un-deletable by the script.
+        if state.get("name") == name:
+            clear_secret_state()
         return
     if not (state.get("created") and state.get("secret_arn") == arn):
         raise SystemExit(

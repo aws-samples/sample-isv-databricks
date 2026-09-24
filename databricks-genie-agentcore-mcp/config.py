@@ -1,17 +1,20 @@
 """Shared configuration for the Databricks Genie via AgentCore Gateway sample.
 
 All values come from environment variables so no credentials are stored in the
-repo. The four Databricks values are required; see README.md for how to obtain
-each one.
+repo. DATABRICKS_HOST, DATABRICKS_CLIENT_ID and GENIE_SPACE_ID are always required.
+For the OAuth secret, supply EITHER the plaintext DATABRICKS_CLIENT_SECRET OR a
+Secrets Manager reference DATABRICKS_SECRET_ARN (the production path); see README.md.
 
     export DATABRICKS_HOST="https://dbc-xxxxxxxx-xxxx.cloud.databricks.com"
     export DATABRICKS_CLIENT_ID="<service principal application ID>"
-    export DATABRICKS_CLIENT_SECRET="<OAuth M2M secret>"
+    export DATABRICKS_CLIENT_SECRET="<OAuth M2M secret>"   # or DATABRICKS_SECRET_ARN
     export GENIE_SPACE_ID="<Genie space ID>"
     export AWS_REGION="us-east-1"
 """
 
 import os
+import re
+import sys
 
 try:
     from dotenv import load_dotenv
@@ -43,6 +46,10 @@ DATABRICKS_SECRET_JSON_KEY = os.environ.get("DATABRICKS_SECRET_JSON_KEY", "clien
 DATABRICKS_SECRET_NAME = os.environ.get(
     "DATABRICKS_SECRET_NAME", "databricks-genie-agentcore/oauth-client-secret"
 )
+# DATABRICKS_SECRET_ARN is fed verbatim into an IAM policy Resource in deploy.py step 4. A bare
+# secret name passes CreateOauth2CredentialProvider but is rejected by put_role_policy AFTER the
+# Cognito pool, IAM role, gateway and provider are already built -- so validate its shape up front.
+_SECRET_ARN_RE = re.compile(r"^arn:aws[a-z0-9-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+")
 
 # Used only by generate_data.py to load the sample dataset. The warehouse is
 # optional: if unset, generate_data.py resolves the one backing GENIE_SPACE_ID.
@@ -105,8 +112,7 @@ def require_databricks_config() -> None:
         if not value
     ]
     # The OAuth secret may come from either the plaintext env var or a Secrets Manager
-    # reference (DATABRICKS_SECRET_ARN, the production path). Require exactly one to be
-    # present -- neither is a hard error; both is fine (the ARN wins in deploy.py).
+    # reference (DATABRICKS_SECRET_ARN, the production path). At least one must be present.
     if not DATABRICKS_CLIENT_SECRET and not DATABRICKS_SECRET_ARN:
         missing.append("DATABRICKS_CLIENT_SECRET or DATABRICKS_SECRET_ARN")
     if missing:
@@ -114,6 +120,24 @@ def require_databricks_config() -> None:
             "Missing required environment variable(s): "
             + ", ".join(missing)
             + "\nSee the Configuration section of README.md."
+        )
+    # A malformed ARN would otherwise fail deep in deploy.py step 4, after four resources
+    # exist. Reject it here, before anything is created.
+    if DATABRICKS_SECRET_ARN and not _SECRET_ARN_RE.match(DATABRICKS_SECRET_ARN):
+        raise SystemExit(
+            f"DATABRICKS_SECRET_ARN is not a Secrets Manager ARN: {DATABRICKS_SECRET_ARN!r}\n"
+            "It is used verbatim as an IAM policy Resource; a bare name is accepted by the "
+            "credential-provider API but rejected at deploy step 4, after the gateway stack is "
+            "already built. Expected arn:aws:secretsmanager:<region>:<account>:secret:<name>. "
+            "Run `python secrets_setup.py` and copy the ARN it prints."
+        )
+    # Both set is allowed (the ARN wins in deploy.py), but a stale or typo'd ARN alongside a
+    # working plaintext silently takes the EXTERNAL path and only fails at invocation. Warn.
+    if DATABRICKS_CLIENT_SECRET and DATABRICKS_SECRET_ARN:
+        print(
+            "Note: both DATABRICKS_CLIENT_SECRET and DATABRICKS_SECRET_ARN are set; deploy.py "
+            "uses the ARN (EXTERNAL path) and ignores the plaintext. Unset one to be explicit.",
+            file=sys.stderr,
         )
 
 

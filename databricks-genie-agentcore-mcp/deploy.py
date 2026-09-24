@@ -129,6 +129,42 @@ def create_gateway(setup: GatewaySetup, persist, prior_state=None) -> dict:
     return state
 
 
+# secrets_setup.py records the key it wrote the client secret under, next to gateway_config.json.
+SECRET_STATE_FILE = os.path.join(os.path.dirname(STATE_FILE), "secret_state.json")
+
+
+def recorded_secret_state() -> dict:
+    """secrets_setup.py's record for the provisioned secret, or {} if absent/unreadable."""
+    try:
+        with open(SECRET_STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def check_secret_json_key() -> None:
+    """Abort if the jsonKey deploy will register disagrees with the one secrets_setup.py wrote.
+
+    Cross-process footgun: the README exports only DATABRICKS_SECRET_ARN into the deploy shell,
+    so a custom DATABRICKS_SECRET_JSON_KEY used at provision time silently defaults back to
+    "client_secret" here. deploy would register a key that isn't in the secret, the target
+    reaches READY, and every tool call 403s. secret_state.json records the key actually written.
+    """
+    if not DATABRICKS_SECRET_ARN:
+        return
+    state = recorded_secret_state()
+    if state.get("secret_arn") != DATABRICKS_SECRET_ARN:
+        return  # the record is for a different/unknown secret; nothing to cross-check
+    recorded = state.get("json_key")
+    if recorded and recorded != DATABRICKS_SECRET_JSON_KEY:
+        raise SystemExit(
+            f"DATABRICKS_SECRET_JSON_KEY mismatch: secrets_setup.py stored the client secret "
+            f"under {recorded!r}, but deploy.py would register jsonKey={DATABRICKS_SECRET_JSON_KEY!r}. "
+            "The provider would read a key that isn't in the secret and every tool call would 403 "
+            f"after the target reaches READY. Run: export DATABRICKS_SECRET_JSON_KEY={recorded!r}"
+        )
+
+
 def client_secret_config() -> dict:
     """Return the clientSecret* fragment of the provider config for the active secret source.
 
@@ -279,6 +315,9 @@ def register_genie_target(agentcore, gateway_id: str, provider_arn: str, on_crea
 
 def deploy() -> None:
     require_databricks_config()
+    # EXTERNAL path: catch a jsonKey drift between provisioning and deploy before building
+    # anything, rather than at the first tool call an hour later.
+    check_secret_json_key()
 
     # Contract rule 3. Checked before anything is created: there is no reuse path for a
     # gateway or a target, so a re-run cannot succeed -- and its first state write would
