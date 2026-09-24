@@ -22,8 +22,9 @@ The secret is a JSON document so it can hold more than one field later; DATABRIC
 
 Two principals read this secret, and AgentCore makes both reads on a principal's behalf rather
 than as itself: the principal running deploy.py reads it at deploy time, and the gateway
-execution role reads it when the cached Databricks token expires (~1 hour). See "Who reads the
-secret" in README.md. The secret is expected to live in the same account as the gateway, so no
+execution role reads it on every token mint -- measured, once per gateway session, so in
+practice once per tool call rather than once per token lifetime. See "Who reads the secret" in
+README.md. The secret is expected to live in the same account as the gateway, so no
 Secrets Manager resource policy is needed. With the account's default Secrets Manager
 encryption there is nothing further to grant; if you encrypt it with a customer-managed KMS key
 instead, BOTH principals above need kms:Decrypt on that key.

@@ -56,11 +56,13 @@ DATABRICKS_SECRET_NAME = os.environ.get(
 # The name charset is botocore's for this API (excludes '*', whitespace and quotes), so a wildcard
 # ARN like ...:secret:* cannot slip through and become an account-wide GetSecretValue grant. The
 # 6-char random suffix AWS appends is REQUIRED: a suffix-less ARN is accepted as a SecretId but the
-# IAM Resource then matches no secret, so the read is denied and tool calls 403 ~an hour after READY.
+# IAM Resource then matches no secret, so the read is denied and tool calls 403 on the first call.
 # ('-' is placed last in the class so it is a literal, not a range.)
+# \Z, not $: $ also matches just before a trailing newline, so "arn:...-abc123\n" would validate
+# and the newline would ride into the IAM Resource, where it matches no secret.
 _SECRET_ARN_RE = re.compile(
     r"^arn:aws[a-z0-9-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:"
-    r"[a-zA-Z0-9_/+=.@!-]+-[A-Za-z0-9]{6}$"
+    r"[a-zA-Z0-9_/+=.@!-]+-[A-Za-z0-9]{6}\Z"
 )
 
 # Used only by generate_data.py to load the sample dataset. The warehouse is

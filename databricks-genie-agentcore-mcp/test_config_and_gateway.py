@@ -120,12 +120,24 @@ class RequireDatabricksConfigTest(unittest.TestCase):
 
     def test_suffixless_arn_rejected(self):
         # A suffix-less ARN is accepted as a SecretId but the IAM Resource then matches no secret,
-        # so the read is denied and tool calls 403 ~an hour after READY. Reject it up front.
+        # so the read is denied and tool calls 403 from the first one. Reject it up front.
         bad = "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-oauth"
         values = dict(self._ALL_PRESENT, DATABRICKS_CLIENT_SECRET="", DATABRICKS_SECRET_ARN=bad)
         with mock.patch.multiple(config, **values):
             with self.assertRaises(SystemExit):
                 config.require_databricks_config()
+
+    def test_trailing_newline_arn_rejected(self):
+        # The pattern must end in \Z, not $: $ also matches just before a final newline, so a
+        # copy-pasted "arn:...-AbCdEf\n" would validate and the newline would ride into the IAM
+        # Resource in deploy step 4, where it matches no secret. A \n anywhere else is covered
+        # by the charset; this pins the one position $ would have let through.
+        for bad in (self._VALID_ARN + "\n", self._VALID_ARN + "\n\n", self._VALID_ARN + "\r\n"):
+            values = dict(self._ALL_PRESENT, DATABRICKS_CLIENT_SECRET="", DATABRICKS_SECRET_ARN=bad)
+            with self.subTest(bad=repr(bad)), mock.patch.multiple(config, **values):
+                with self.assertRaises(SystemExit) as ctx:
+                    config.require_databricks_config()
+                self.assertIn("DATABRICKS_SECRET_ARN", str(ctx.exception))
 
     def test_empty_json_key_rejected_when_arn_set(self):
         # An empty jsonKey defeats the client_secret default and is rejected by botocore at deploy
