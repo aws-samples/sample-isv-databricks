@@ -134,6 +134,69 @@ export GENIE_SPACE_ID="<new space ID>"
 python deploy.py                      # register a target for the new space
 ```
 
+### Reference the secret from Secrets Manager (production)
+
+By default `deploy.py` passes the plaintext `DATABRICKS_CLIENT_SECRET` into the credential
+provider, and AgentCore stores it in a secret it creates and owns. That keeps the walkthrough
+to one command, but the plaintext lives in your `.env` / shell. The production-shaped pattern
+is to hold the secret in **your** Secrets Manager and have the provider reference it by ARN —
+AgentCore's custom OAuth2 provider supports this natively (`clientSecretSource=EXTERNAL`).
+
+`secrets_setup.py` provisions that secret. Run it once, then point `deploy.py` at the ARN:
+
+```bash
+export DATABRICKS_CLIENT_SECRET="<OAuth M2M secret>"   # needed once, to seed the secret
+python secrets_setup.py                                # creates the SM secret, prints the ARN
+export DATABRICKS_SECRET_ARN="arn:aws:secretsmanager:...:secret:...-abcde"
+unset DATABRICKS_CLIENT_SECRET                         # deploy.py no longer needs the plaintext
+python deploy.py                                       # provider registered as EXTERNAL
+```
+
+With `DATABRICKS_SECRET_ARN` set, `deploy.py` registers the provider referencing the secret
+(not inline) and scopes the gateway role's `secretsmanager:GetSecretValue` to exactly that
+ARN — the same least-privilege grant, now pointed at a secret you own and rotate. The secret
+is a JSON document; `DATABRICKS_SECRET_JSON_KEY` (default `client_secret`) names the key that
+holds the value.
+
+If you set a **non-default** `DATABRICKS_SECRET_JSON_KEY` at provision time, you do **not** need
+to re-export it for `deploy.py`: `secrets_setup.py` records the key it wrote next to
+`gateway_config.json`, and `deploy.py` adopts that recorded key for this ARN automatically (the
+block above exports only the ARN). Export `DATABRICKS_SECRET_JSON_KEY` again only to deliberately
+override it — `deploy.py` then honors your value and warns if it differs from the recorded one.
+This keeps the ARN and its key together across the two processes rather than letting a mismatch
+surface as a 403 an hour after the target is READY.
+
+Notes:
+
+- **Lifecycle.** `secrets_setup.py` owns the secret it creates. `cleanup.py` removes only the
+  AWS gateway resources and, in EXTERNAL mode, does **not** delete your secret. Tear it down
+  with `python secrets_setup.py --delete` (30-day recovery window by default; `--force` to
+  delete immediately).
+- **Who reads the secret.** Two different principals do, at two different times. AgentCore
+  makes both reads on a principal's behalf, so both appear in CloudTrail as that principal
+  with `invokedBy: bedrock-agentcore.amazonaws.com`:
+  - **At deploy time** — `CreateOauth2CredentialProvider`, `CreateGatewayTarget` and
+    `SynchronizeGatewayTargets` each read the secret as **the principal running `deploy.py`**.
+    Your own credentials therefore need `secretsmanager:GetSecretValue` on this secret.
+    Nothing in this sample grants that, and on an administrator principal you will never
+    notice it was required. (`secrets_setup.py` also needs `GetSecretValue` when it adopts an
+    existing secret: it reads the current value to **merge** your key in rather than clobber
+    sibling keys. That read-modify-write is not concurrency-safe — don't run two at once.)
+  - **On token refresh** — the Databricks token is cached for its lifetime (~1 hour), so no
+    read happens during that window. When it expires, the refresh reads the secret as the
+    **gateway execution role**. That is the grant `deploy.py` attaches in step 4, scoped to
+    this ARN. Omit it and tool calls succeed for about an hour, then start failing.
+
+  This walkthrough assumes the secret lives in **the same account as the gateway**. Both
+  principals above are then same-account, so a Secrets Manager **resource policy is not
+  required**. Putting the secret in a different account is a different problem — it needs a
+  resource policy and a CMK grant naming the reading principals — and is not covered here.
+- **Encryption.** The default AWS-managed Secrets Manager key needs no extra grant. If you
+  encrypt the secret with a customer-managed KMS key, **both** principals above need
+  `kms:Decrypt` on that key. (The CMK case is not exercised by this sample.)
+- **Seeding vs. gateway.** This is independent of `generate_data.py`, which still uses
+  `DATABRICKS_CLIENT_SECRET` directly for its one-time DDL.
+
 ## Files
 
 | File | Purpose |
@@ -146,6 +209,7 @@ python deploy.py                      # register a target for the new space
 | `invoke_runtime.py` | Invokes the deployed Runtime agent via `invoke_agent_runtime`. |
 | `cleanup.py` | Deletes the target, credential provider, gateway, IAM role and Cognito user pool. |
 | `generate_data.py` | Loads a tiny Unity Catalog dataset (`products`, `sales`) via the SQL Statement Execution API so a fresh Genie space can answer the sample questions. Optional. |
+| `secrets_setup.py` | Stages the Databricks OAuth M2M secret in AWS Secrets Manager and prints its ARN, so `deploy.py` can reference it (`clientSecretSource=EXTERNAL`) instead of taking the plaintext inline. Optional, production path. |
 | `test_cleanup_contract.py` | Unit tests pinning `cleanup.py`'s teardown ownership and state contract. No test framework and no new dependency beyond `requirements.txt`. |
 | `test_config_and_gateway.py` | Unit tests for the config and gateway wiring: env fail-fast, the Genie MCP URL, the credential-provider secret-ARN guard, and the IAM policy shape. No test framework and no new dependency beyond `requirements.txt`. |
 | `test_generate_data.py` | Unit tests for `generate_data.py`'s data-safety rules: SQL literal escaping, the seeding identity, the case-insensitive existence checks, the `--drop` and adopted-table refusals, and the bounded HTTP/statement polling. No test framework and no new dependency beyond `requirements.txt`. |
@@ -174,7 +238,10 @@ python deploy.py
 3. **Create the Databricks credential provider** — registers the service principal's
    OAuth2 client credentials via `create_oauth2_credential_provider()`, pointing
    discovery at your workspace's `/oidc/v1/token` endpoint. This is the outbound auth
-   Gateway uses when it calls Databricks.
+   Gateway uses when it calls Databricks. By default the plaintext `DATABRICKS_CLIENT_SECRET`
+   is passed inline and AgentCore stores it in a secret it manages; to reference your own
+   Secrets Manager secret instead, see
+   [Reference the secret from Secrets Manager](#reference-the-secret-from-secrets-manager-production).
 4. **Grant the gateway role permissions** — attaches an inline policy allowing
    `GetWorkloadAccessToken` / `GetWorkloadAccessTokenForJWT`, `GetResourceOauth2Token`
    on the provider, and `secretsmanager:GetSecretValue` on the stored secret. Without
@@ -347,11 +414,12 @@ The tests need no test framework and no dependency beyond the sample's own
 import `boto3`, `requests` and `yaml` at module scope), so install the requirements first,
 then run them. They stub the boto3 clients and cover the pieces whose failure is silent or
 only surfaces mid-deployment: teardown ownership (`test_cleanup_contract.py`); config
-fail-fast, the Genie MCP URL, the credential-provider secret-ARN guard, and the IAM policy
-shape (`test_config_and_gateway.py`); and — for the one script here that writes to your
-Unity Catalog — SQL literal escaping, the seeding identity, and the refusals that keep
-`generate_data.py` from touching a catalog, schema or table it did not create
-(`test_generate_data.py`).
+fail-fast, the Genie MCP URL, the inline-vs-Secrets-Manager credential shape, the
+credential-provider secret-ARN guard, the IAM policy shape, and `secrets_setup.py`'s
+create-vs-adopt and `--delete` guards (`test_config_and_gateway.py`); and — for the one
+script here that writes to your Unity Catalog — SQL literal escaping, the seeding identity,
+and the refusals that keep `generate_data.py` from touching a catalog, schema or table it
+did not create (`test_generate_data.py`).
 
 Run them from this package directory — `unittest discover` from the repo root finds no
 tests and exits 0, which reads as a green run that tested nothing:

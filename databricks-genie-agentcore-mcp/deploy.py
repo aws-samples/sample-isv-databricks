@@ -14,6 +14,7 @@ Usage:
 
 import json
 import os
+import sys
 import time
 
 import boto3
@@ -23,6 +24,9 @@ from config import (
     DATABRICKS_CLIENT_ID,
     DATABRICKS_CLIENT_SECRET,
     DATABRICKS_HOST,
+    DATABRICKS_SECRET_ARN,
+    DATABRICKS_SECRET_JSON_KEY,
+    DATABRICKS_SECRET_JSON_KEY_SET,
     GATEWAY_NAME,
     GENIE_SPACE_ID,
     IAM_POLICY_NAME,
@@ -127,6 +131,88 @@ def create_gateway(setup: GatewaySetup, persist, prior_state=None) -> dict:
     return state
 
 
+# secrets_setup.py records the key it wrote the client secret under, next to gateway_config.json.
+SECRET_STATE_FILE = os.path.join(os.path.dirname(STATE_FILE), "secret_state.json")
+
+
+def recorded_secret_state() -> dict:
+    """secrets_setup.py's record for the provisioned secret, or {} if absent/unreadable.
+
+    Catches OSError (not just FileNotFoundError) and a non-object JSON body, so a permission
+    error, a directory in the path, or a state file holding `[1,2]`/`"a"`/`null` degrades to
+    {} rather than crashing the caller on `.get`.
+    """
+    try:
+        with open(SECRET_STATE_FILE) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def resolve_secret_json_key() -> str:
+    """Return the jsonKey deploy should register, defaulting it from secret_state.json.
+
+    The ARN and the key that indexes it must travel together across two processes, but the
+    README exports only DATABRICKS_SECRET_ARN into the deploy shell -- so a custom key used at
+    provision time silently reverts to the "client_secret" default here, the provider reads a
+    key that isn't in the secret, and every tool call 403s ~an hour after the target is READY.
+    secret_state.json records the key secrets_setup.py actually wrote. When it describes THIS
+    ARN, adopt that key unless the operator set DATABRICKS_SECRET_JSON_KEY explicitly; defaulting
+    from the record removes the drift class rather than guarding it. An explicit value that
+    disagrees is honored -- provision() merges, so an older key is usually still present -- with
+    a warning rather than an abort, since the previous guard rejected deploys that would work.
+    """
+    if not DATABRICKS_SECRET_ARN:
+        return DATABRICKS_SECRET_JSON_KEY
+    state = recorded_secret_state()
+    if state.get("secret_arn") != DATABRICKS_SECRET_ARN:
+        return DATABRICKS_SECRET_JSON_KEY  # record is for a different/unknown secret
+    recorded = state.get("json_key")
+    if not recorded:
+        return DATABRICKS_SECRET_JSON_KEY
+    if not DATABRICKS_SECRET_JSON_KEY_SET:
+        if recorded != DATABRICKS_SECRET_JSON_KEY:
+            print(
+                f"  Using jsonKey {recorded!r} recorded by secrets_setup.py for this secret "
+                "(export DATABRICKS_SECRET_JSON_KEY to override)."
+            )
+        return recorded
+    if recorded != DATABRICKS_SECRET_JSON_KEY:
+        print(
+            f"Note: DATABRICKS_SECRET_JSON_KEY={DATABRICKS_SECRET_JSON_KEY!r} differs from the key "
+            f"{recorded!r} secrets_setup.py recorded for this secret. Proceeding with your explicit "
+            "value; if tool calls 403 after READY, the secret has no such key.",
+            file=sys.stderr,
+        )
+    return DATABRICKS_SECRET_JSON_KEY
+
+
+def client_secret_config() -> dict:
+    """Return the clientSecret* fragment of the provider config for the active secret source.
+
+    Two mutually exclusive shapes the API accepts under customOauth2ProviderConfig:
+
+    - MANAGED (default): pass the plaintext `clientSecret`. AgentCore stores it in a
+      Secrets Manager secret it creates and owns, and returns that ARN.
+    - EXTERNAL: pass `clientSecretSource="EXTERNAL"` + `clientSecretConfig` referencing a
+      Secrets Manager secret you already provisioned (see secrets_setup.py). The plaintext
+      never passes through deploy.py or lives in .env. AgentCore references the secret;
+      it does not own or delete it.
+
+    Selected by DATABRICKS_SECRET_ARN: set -> EXTERNAL, unset -> MANAGED.
+    """
+    if DATABRICKS_SECRET_ARN:
+        return {
+            "clientSecretSource": "EXTERNAL",
+            "clientSecretConfig": {
+                "secretId": DATABRICKS_SECRET_ARN,
+                "jsonKey": DATABRICKS_SECRET_JSON_KEY,
+            },
+        }
+    return {"clientSecret": DATABRICKS_CLIENT_SECRET}
+
+
 def create_credential_provider(agentcore) -> tuple:
     """Register Databricks OAuth2 client-credentials as an outbound provider."""
     token_endpoint = f"{DATABRICKS_HOST}/oidc/v1/token"
@@ -136,7 +222,10 @@ def create_credential_provider(agentcore) -> tuple:
     # the authorization-code path the README points readers toward.
     authorization_endpoint = f"{DATABRICKS_HOST}/oidc/v1/authorize"
 
-    print("Creating Databricks OAuth2 credential provider...")
+    if DATABRICKS_SECRET_ARN:
+        print(f"Creating Databricks OAuth2 credential provider (secret from {DATABRICKS_SECRET_ARN})...")
+    else:
+        print("Creating Databricks OAuth2 credential provider (secret managed by AgentCore)...")
     # Deliberately no pre-emptive delete here. A live target holds a
     # credentialProviderConfigurations reference to this provider, so removing it would
     # break a working deployment before anything is recreated -- and the name is shared
@@ -155,26 +244,29 @@ def create_credential_provider(agentcore) -> tuple:
                     }
                 },
                 "clientId": DATABRICKS_CLIENT_ID,
-                "clientSecret": DATABRICKS_CLIENT_SECRET,
+                **client_secret_config(),
             }
         },
     )
     provider_arn = provider["credentialProviderArn"]
-    _client_secret = provider.get("clientSecretArn")
-    if isinstance(_client_secret, dict):
-        _client_secret = _client_secret.get("secretArn", "")
-    secret_arn = provider.get("secretArn") or _client_secret or ""
+    # In EXTERNAL mode we provisioned the secret ourselves, so its ARN is authoritative --
+    # scope the step-4 grant to it directly rather than trusting the response shape. In
+    # MANAGED mode AgentCore owns the secret and only the response reveals its ARN:
+    # CreateOauth2CredentialProviderResponse.clientSecretArn is a REQUIRED member of shape
+    # Secret={secretArn}, so read it directly. (There is no flat 'secretArn' member.)
+    if DATABRICKS_SECRET_ARN:
+        secret_arn = DATABRICKS_SECRET_ARN
+    else:
+        client_secret_arn = provider.get("clientSecretArn")
+        secret_arn = client_secret_arn.get("secretArn", "") if isinstance(client_secret_arn, dict) else ""
     if not secret_arn:
-        # The response shape isn't stable, so we probe two known keys above; if
-        # both miss we get "". Fail loudly here: an empty ARN would drop the
-        # secretsmanager:GetSecretValue grant in step 4, the target would still
-        # reach READY, and every tool call would then 403 at invocation with
-        # nothing pointing at the cause.
+        # An empty ARN would drop the secretsmanager:GetSecretValue grant in step 4, the
+        # target would still reach READY, and every tool call would then 403 at invocation
+        # with nothing pointing at the cause. Fail loudly here instead.
         raise SystemExit(
-            "Credential provider returned no secret ARN (checked 'secretArn' and "
-            "'clientSecretArn.secretArn'). The AgentCore response shape may have "
-            "changed. Cannot scope the gateway role's secret read — aborting before "
-            "the target is built."
+            "Credential provider returned no secret ARN under 'clientSecretArn.secretArn'. "
+            "The AgentCore response shape may have changed. Cannot scope the gateway role's "
+            "secret read — aborting before the target is built."
         )
     print(f"  Credential provider ARN: {provider_arn}")
     return provider_arn, secret_arn
@@ -242,6 +334,11 @@ def register_genie_target(agentcore, gateway_id: str, provider_arn: str, on_crea
 
 def deploy() -> None:
     require_databricks_config()
+    # EXTERNAL path: resolve the jsonKey before building anything -- adopt the key
+    # secrets_setup.py recorded for this ARN unless the operator set one explicitly, so a
+    # drift between provisioning and deploy can't surface as a 403 an hour after READY.
+    global DATABRICKS_SECRET_JSON_KEY
+    DATABRICKS_SECRET_JSON_KEY = resolve_secret_json_key()
 
     # Contract rule 3. Checked before anything is created: there is no reuse path for a
     # gateway or a target, so a re-run cannot succeed -- and its first state write would

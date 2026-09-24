@@ -1,17 +1,20 @@
 """Shared configuration for the Databricks Genie via AgentCore Gateway sample.
 
 All values come from environment variables so no credentials are stored in the
-repo. The four Databricks values are required; see README.md for how to obtain
-each one.
+repo. DATABRICKS_HOST, DATABRICKS_CLIENT_ID and GENIE_SPACE_ID are always required.
+For the OAuth secret, supply EITHER the plaintext DATABRICKS_CLIENT_SECRET OR a
+Secrets Manager reference DATABRICKS_SECRET_ARN (the production path); see README.md.
 
     export DATABRICKS_HOST="https://dbc-xxxxxxxx-xxxx.cloud.databricks.com"
     export DATABRICKS_CLIENT_ID="<service principal application ID>"
-    export DATABRICKS_CLIENT_SECRET="<OAuth M2M secret>"
+    export DATABRICKS_CLIENT_SECRET="<OAuth M2M secret>"   # or DATABRICKS_SECRET_ARN
     export GENIE_SPACE_ID="<Genie space ID>"
     export AWS_REGION="us-east-1"
 """
 
 import os
+import re
+import sys
 
 try:
     from dotenv import load_dotenv
@@ -29,6 +32,36 @@ DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "").rstrip("/")
 DATABRICKS_CLIENT_ID = os.environ.get("DATABRICKS_CLIENT_ID", "")
 DATABRICKS_CLIENT_SECRET = os.environ.get("DATABRICKS_CLIENT_SECRET", "")
 GENIE_SPACE_ID = os.environ.get("GENIE_SPACE_ID", "")
+
+# Optional production path for the OAuth M2M secret. When DATABRICKS_SECRET_ARN is set,
+# deploy.py registers the credential provider with clientSecretSource="EXTERNAL" and points
+# it at this Secrets Manager secret (see secrets_setup.py) instead of passing the plaintext
+# DATABRICKS_CLIENT_SECRET inline. The secret is a JSON document; DATABRICKS_SECRET_JSON_KEY
+# names the key that holds the client secret value. With the ARN set, DATABRICKS_CLIENT_SECRET
+# is not needed for deploy.py -- the plaintext never has to live in .env or the shell.
+DATABRICKS_SECRET_ARN = os.environ.get("DATABRICKS_SECRET_ARN", "")
+DATABRICKS_SECRET_JSON_KEY = os.environ.get("DATABRICKS_SECRET_JSON_KEY", "client_secret")
+# Whether the operator set the key explicitly (vs. taking the default). deploy.py adopts the
+# key secrets_setup.py recorded for the secret UNLESS it was set here, so the ARN and its key
+# stay together across the two processes without the operator re-exporting the key.
+DATABRICKS_SECRET_JSON_KEY_SET = "DATABRICKS_SECRET_JSON_KEY" in os.environ
+# Name of the Secrets Manager secret that secrets_setup.py creates/updates. Only used by
+# secrets_setup.py; deploy.py references the secret by ARN via DATABRICKS_SECRET_ARN.
+DATABRICKS_SECRET_NAME = os.environ.get(
+    "DATABRICKS_SECRET_NAME", "databricks-genie-agentcore/oauth-client-secret"
+)
+# DATABRICKS_SECRET_ARN is fed verbatim into an IAM policy Resource in deploy.py step 4. A bare
+# secret name passes CreateOauth2CredentialProvider but is rejected by put_role_policy AFTER the
+# Cognito pool, IAM role, gateway and provider are already built -- so validate its shape up front.
+# The name charset is botocore's for this API (excludes '*', whitespace and quotes), so a wildcard
+# ARN like ...:secret:* cannot slip through and become an account-wide GetSecretValue grant. The
+# 6-char random suffix AWS appends is REQUIRED: a suffix-less ARN is accepted as a SecretId but the
+# IAM Resource then matches no secret, so the read is denied and tool calls 403 ~an hour after READY.
+# ('-' is placed last in the class so it is a literal, not a range.)
+_SECRET_ARN_RE = re.compile(
+    r"^arn:aws[a-z0-9-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:"
+    r"[a-zA-Z0-9_/+=.@!-]+-[A-Za-z0-9]{6}$"
+)
 
 # Used only by generate_data.py to load the sample dataset. The warehouse is
 # optional: if unset, generate_data.py resolves the one backing GENIE_SPACE_ID.
@@ -86,16 +119,46 @@ def require_databricks_config() -> None:
         for name, value in (
             ("DATABRICKS_HOST", DATABRICKS_HOST),
             ("DATABRICKS_CLIENT_ID", DATABRICKS_CLIENT_ID),
-            ("DATABRICKS_CLIENT_SECRET", DATABRICKS_CLIENT_SECRET),
             ("GENIE_SPACE_ID", GENIE_SPACE_ID),
         )
         if not value
     ]
+    # The OAuth secret may come from either the plaintext env var or a Secrets Manager
+    # reference (DATABRICKS_SECRET_ARN, the production path). At least one must be present.
+    if not DATABRICKS_CLIENT_SECRET and not DATABRICKS_SECRET_ARN:
+        missing.append("DATABRICKS_CLIENT_SECRET or DATABRICKS_SECRET_ARN")
     if missing:
         raise SystemExit(
             "Missing required environment variable(s): "
             + ", ".join(missing)
             + "\nSee the Configuration section of README.md."
+        )
+    # A malformed ARN would otherwise fail deep in deploy.py step 4, after four resources
+    # exist. Reject it here, before anything is created.
+    if DATABRICKS_SECRET_ARN and not _SECRET_ARN_RE.match(DATABRICKS_SECRET_ARN):
+        raise SystemExit(
+            f"DATABRICKS_SECRET_ARN is not a Secrets Manager ARN: {DATABRICKS_SECRET_ARN!r}\n"
+            "It is used verbatim as an IAM policy Resource; a bare name is accepted by the "
+            "credential-provider API but rejected at deploy step 4, after the gateway stack is "
+            "already built. Expected arn:aws:secretsmanager:<region>:<account>:secret:<name>-<suffix> "
+            "(with the 6-character suffix AWS assigns; no '*' or whitespace). "
+            "Run `python secrets_setup.py` and copy the ARN it prints."
+        )
+    # jsonKey rides into clientSecretConfig; botocore rejects an empty or >128-char value at
+    # deploy step 3, after the pool/role/gateway exist. An empty value also defeats the default
+    # and writes a secret keyed "". Only meaningful on the EXTERNAL (ARN) path.
+    if DATABRICKS_SECRET_ARN and not (1 <= len(DATABRICKS_SECRET_JSON_KEY) <= 128):
+        raise SystemExit(
+            f"DATABRICKS_SECRET_JSON_KEY must be 1-128 characters, got {len(DATABRICKS_SECRET_JSON_KEY)}. "
+            "It names the key inside the Secrets Manager JSON that holds the OAuth secret."
+        )
+    # Both set is allowed (the ARN wins in deploy.py), but a stale or typo'd ARN alongside a
+    # working plaintext silently takes the EXTERNAL path and only fails at invocation. Warn.
+    if DATABRICKS_CLIENT_SECRET and DATABRICKS_SECRET_ARN:
+        print(
+            "Note: both DATABRICKS_CLIENT_SECRET and DATABRICKS_SECRET_ARN are set; deploy.py "
+            "uses the ARN (EXTERNAL path) and ignores the plaintext. Unset one to be explicit.",
+            file=sys.stderr,
         )
 
 
