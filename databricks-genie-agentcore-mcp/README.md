@@ -442,6 +442,15 @@ python -m unittest test_config_and_gateway -v
 - [Strands Agents](https://strandsagents.com/)
 - [AgentCore Gateway tutorials](https://github.com/awslabs/agentcore-samples/tree/main/01-tutorials/02-AgentCore-gateway)
 
+## Acknowledgements
+
+- [@antonyprasad-db](https://github.com/antonyprasad-db) — original author of this sample, and
+  author of the unit-test suite and the CI workflow that gates it.
+- [@spendyaala](https://github.com/spendyaala) — the optional AWS Secrets Manager path for the
+  Databricks OAuth secret (`secrets_setup.py` and the `EXTERNAL` credential-provider mode).
+- [@venkatavaradhanv](https://github.com/venkatavaradhanv) — documentation and live-deployment
+  validation.
+
 ## Security disclaimer
 
 This is sample code, for non-production usage. You should work with your security and legal teams
