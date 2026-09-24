@@ -156,7 +156,7 @@ def resolve_secret_json_key() -> str:
     The ARN and the key that indexes it must travel together across two processes, but the
     README exports only DATABRICKS_SECRET_ARN into the deploy shell -- so a custom key used at
     provision time silently reverts to the "client_secret" default here, the provider reads a
-    key that isn't in the secret, and every tool call 403s ~an hour after the target is READY.
+    key that isn't in the secret, and every tool call 403s from the first one after READY.
     secret_state.json records the key secrets_setup.py actually wrote. When it describes THIS
     ARN, adopt that key unless the operator set DATABRICKS_SECRET_JSON_KEY explicitly; defaulting
     from the record removes the drift class rather than guarding it. An explicit value that
@@ -336,7 +336,7 @@ def deploy() -> None:
     require_databricks_config()
     # EXTERNAL path: resolve the jsonKey before building anything -- adopt the key
     # secrets_setup.py recorded for this ARN unless the operator set one explicitly, so a
-    # drift between provisioning and deploy can't surface as a 403 an hour after READY.
+    # drift between provisioning and deploy can't surface as a 403 on the first tool call.
     global DATABRICKS_SECRET_JSON_KEY
     DATABRICKS_SECRET_JSON_KEY = resolve_secret_json_key()
 

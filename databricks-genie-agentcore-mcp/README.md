@@ -164,7 +164,7 @@ to re-export it for `deploy.py`: `secrets_setup.py` records the key it wrote nex
 block above exports only the ARN). Export `DATABRICKS_SECRET_JSON_KEY` again only to deliberately
 override it — `deploy.py` then honors your value and warns if it differs from the recorded one.
 This keeps the ARN and its key together across the two processes rather than letting a mismatch
-surface as a 403 an hour after the target is READY.
+surface as a 403 on the first tool call after the target is READY.
 
 Notes:
 
@@ -182,10 +182,14 @@ Notes:
     notice it was required. (`secrets_setup.py` also needs `GetSecretValue` when it adopts an
     existing secret: it reads the current value to **merge** your key in rather than clobber
     sibling keys. That read-modify-write is not concurrency-safe — don't run two at once.)
-  - **On token refresh** — the Databricks token is cached for its lifetime (~1 hour), so no
-    read happens during that window. When it expires, the refresh reads the secret as the
-    **gateway execution role**. That is the grant `deploy.py` attaches in step 4, scoped to
-    this ARN. Omit it and tool calls succeed for about an hour, then start failing.
+  - **On every token mint** — minting the Databricks token reads the secret as the **gateway
+    execution role**. That is the grant `deploy.py` attaches in step 4, scoped to this ARN.
+    Measured, a mint happens per gateway session rather than once per token lifetime: a single
+    question that called `query_space` and then `poll_response` produced **two**
+    `GetSecretValue` calls 21 seconds apart, from two different `gateway-session-*` role
+    sessions. Do not count on a quiet window between reads. Omit the grant and tool calls fail
+    **immediately**, not an hour later — budget KMS `Decrypt` volume on a customer-managed key
+    per tool call, not per hour.
 
   This walkthrough assumes the secret lives in **the same account as the gateway**. Both
   principals above are then same-account, so a Secrets Manager **resource policy is not
