@@ -8,9 +8,9 @@ whose failure is silent or only surfaces mid-deployment against a live account:
     - genie_mcp_url()               the exact Databricks-managed MCP endpoint shape
     - client_secret_config()        the MANAGED (inline) vs EXTERNAL (Secrets Manager
                                     reference) provider-config fragment
-    - create_credential_provider()  the fail-fast guard on a missing secret ARN, the two
-                                    response shapes it must accept, and that EXTERNAL mode
-                                    scopes the grant to the ARN we provisioned
+    - create_credential_provider()  the fail-fast guard on a missing secret ARN, reading it off
+                                    the real response shape (clientSecretArn.secretArn), and that
+                                    EXTERNAL mode scopes the grant to the ARN we provisioned
     - grant_oauth_permissions()     the IAM policy shape -- notably that the secret
                                     read is scoped to one ARN and never falls back to "*"
     - secrets_setup.py              the secret JSON payload, create-vs-adopt bookkeeping,
@@ -74,14 +74,24 @@ class RequireDatabricksConfigTest(unittest.TestCase):
                     config.require_databricks_config()
                 self.assertIn(missing, str(ctx.exception))
 
-    # A well-formed Secrets Manager ARN (region + 12-digit account + secret name).
-    _VALID_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-abcde"
+    # A well-formed Secrets Manager ARN (region + 12-digit account + name + 6-char suffix).
+    _VALID_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-AbCdEf"
 
     def test_secret_arn_satisfies_without_plaintext(self):
         # The whole point of the production path: no plaintext secret in the environment.
         values = dict(self._ALL_PRESENT, DATABRICKS_CLIENT_SECRET="", DATABRICKS_SECRET_ARN=self._VALID_ARN)
         with mock.patch.multiple(config, **values):
             config.require_databricks_config()  # no exception
+
+    def test_valid_arn_accepts_other_partitions(self):
+        # The validator must not over-reject gov/cn/iso partitions.
+        for arn in (
+            "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:db-AbCdEf",
+            "arn:aws-cn:secretsmanager:cn-north-1:123456789012:secret:db-AbCdEf",
+        ):
+            values = dict(self._ALL_PRESENT, DATABRICKS_CLIENT_SECRET="", DATABRICKS_SECRET_ARN=arn)
+            with self.subTest(arn=arn), mock.patch.multiple(config, **values):
+                config.require_databricks_config()  # no exception
 
     def test_malformed_secret_arn_aborts_before_deploy(self):
         # A bare name (or any non-ARN) is accepted by the credential-provider API but fails at
@@ -94,6 +104,42 @@ class RequireDatabricksConfigTest(unittest.TestCase):
                 with self.assertRaises(SystemExit) as ctx:
                     config.require_databricks_config()
                 self.assertIn("DATABRICKS_SECRET_ARN", str(ctx.exception))
+
+    def test_wildcard_arn_rejected_so_it_never_reaches_the_iam_policy(self):
+        # A wildcard ARN is well-formed but would become an account-wide GetSecretValue grant
+        # in deploy step 4 -- the '*' passes an unanchored/.+ pattern but must be rejected here.
+        for wild in (
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:*",
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-*",
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:db AbCdEf",  # whitespace
+        ):
+            values = dict(self._ALL_PRESENT, DATABRICKS_CLIENT_SECRET="", DATABRICKS_SECRET_ARN=wild)
+            with self.subTest(wild=wild), mock.patch.multiple(config, **values):
+                with self.assertRaises(SystemExit):
+                    config.require_databricks_config()
+
+    def test_suffixless_arn_rejected(self):
+        # A suffix-less ARN is accepted as a SecretId but the IAM Resource then matches no secret,
+        # so the read is denied and tool calls 403 ~an hour after READY. Reject it up front.
+        bad = "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-oauth"
+        values = dict(self._ALL_PRESENT, DATABRICKS_CLIENT_SECRET="", DATABRICKS_SECRET_ARN=bad)
+        with mock.patch.multiple(config, **values):
+            with self.assertRaises(SystemExit):
+                config.require_databricks_config()
+
+    def test_empty_json_key_rejected_when_arn_set(self):
+        # An empty jsonKey defeats the client_secret default and is rejected by botocore at deploy
+        # step 3, after the pool/role/gateway exist. Reject it up front alongside the ARN.
+        values = dict(
+            self._ALL_PRESENT,
+            DATABRICKS_CLIENT_SECRET="",
+            DATABRICKS_SECRET_ARN=self._VALID_ARN,
+            DATABRICKS_SECRET_JSON_KEY="",
+        )
+        with mock.patch.multiple(config, **values):
+            with self.assertRaises(SystemExit) as ctx:
+                config.require_databricks_config()
+        self.assertIn("DATABRICKS_SECRET_JSON_KEY", str(ctx.exception))
 
     def test_warns_when_both_secret_and_arn_set(self):
         values = dict(self._ALL_PRESENT, DATABRICKS_CLIENT_SECRET="secret", DATABRICKS_SECRET_ARN=self._VALID_ARN)
@@ -150,11 +196,13 @@ class _FakeAgentCore:
 
 
 class CreateCredentialProviderSecretArnTest(unittest.TestCase):
-    """create_credential_provider() resolves the secret ARN across response shapes,
-    and fails loudly rather than silently dropping the secret-read grant.
+    """create_credential_provider() reads the secret ARN off the real response shape, and
+    fails loudly rather than silently dropping the secret-read grant.
 
     These pin the default MANAGED path (no DATABRICKS_SECRET_ARN), where the ARN is only
-    knowable from the response; the EXTERNAL path is covered separately below.
+    knowable from the response. CreateOauth2CredentialProviderResponse carries it as the
+    REQUIRED member clientSecretArn of shape Secret={secretArn}; there is no flat 'secretArn'
+    member, so we read clientSecretArn.secretArn only. The EXTERNAL path is covered below.
     """
 
     _FakeAgentCore = _FakeAgentCore
@@ -167,37 +215,28 @@ class CreateCredentialProviderSecretArnTest(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             return deploy.create_credential_provider(fake)
 
-    def test_flat_secret_arn(self):
-        fake = self._FakeAgentCore(
-            {"credentialProviderArn": "arn:prov", "secretArn": "arn:aws:secretsmanager:...:secret:x"}
-        )
-        provider_arn, secret_arn = self._create(fake)
-        self.assertEqual(provider_arn, "arn:prov")
-        self.assertEqual(secret_arn, "arn:aws:secretsmanager:...:secret:x")
-
-    def test_nested_client_secret_arn(self):
+    def test_reads_client_secret_arn(self):
         fake = self._FakeAgentCore(
             {"credentialProviderArn": "arn:prov", "clientSecretArn": {"secretArn": "arn:nested"}}
         )
-        _, secret_arn = self._create(fake)
+        provider_arn, secret_arn = self._create(fake)
+        self.assertEqual(provider_arn, "arn:prov")
         self.assertEqual(secret_arn, "arn:nested")
 
-    def test_flat_arn_wins_over_nested(self):
-        fake = self._FakeAgentCore(
-            {
-                "credentialProviderArn": "arn:prov",
-                "secretArn": "arn:flat",
-                "clientSecretArn": {"secretArn": "arn:nested"},
-            }
-        )
-        _, secret_arn = self._create(fake)
-        self.assertEqual(secret_arn, "arn:flat")
-
-    def test_missing_secret_arn_aborts(self):
+    def test_missing_client_secret_arn_aborts(self):
         fake = self._FakeAgentCore({"credentialProviderArn": "arn:prov"})
         with self.assertRaises(SystemExit) as ctx:
             self._create(fake)
         self.assertIn("secret ARN", str(ctx.exception))
+
+    def test_malformed_client_secret_arn_aborts(self):
+        # Present but not the Secret={secretArn} shape (e.g. a bare string, or missing secretArn):
+        # must not crash and must not silently drop the grant.
+        for bad in ("not-a-dict", {}, {"other": "x"}):
+            fake = self._FakeAgentCore({"credentialProviderArn": "arn:prov", "clientSecretArn": bad})
+            with self.subTest(bad=bad), self.assertRaises(SystemExit) as ctx:
+                self._create(fake)
+            self.assertIn("secret ARN", str(ctx.exception))
 
 
 class ClientSecretConfigTest(unittest.TestCase):
@@ -343,13 +382,15 @@ class _FakeSecretsManager:
     class ResourceNotFoundException(Exception):
         pass
 
-    def __init__(self, existing=None, values=None, deleted=()):
+    def __init__(self, existing=None, values=None, deleted=(), binary=None):
         # existing: {name: arn} for secrets that already exist.
         # values:   {name: SecretString} for the current stored value (for the merge path).
         # deleted:  names whose describe_secret should report a DeletedDate (recovery window).
+        # binary:   {name: bytes} whose get_secret_value returns SecretBinary and no SecretString.
         self._store = dict(existing or {})
         self._values = dict(values or {})
         self._deleted = set(deleted)
+        self._binary = dict(binary or {})
         self.exceptions = self  # so client.exceptions.ResourceNotFoundException resolves
         self.calls = []
 
@@ -363,8 +404,14 @@ class _FakeSecretsManager:
         return out
 
     def get_secret_value(self, SecretId):
+        # Mirror the real API: a version carries either SecretString or SecretBinary, never both,
+        # and a binary secret's response has NO SecretString key at all.
         self.calls.append(("get_secret_value", SecretId))
-        return {"SecretString": self._values.get(SecretId)}
+        if SecretId in self._binary:
+            return {"SecretBinary": self._binary[SecretId]}
+        if SecretId in self._values:
+            return {"SecretString": self._values[SecretId]}
+        return {}
 
     def create_secret(self, Name, SecretString, Description=None):
         arn = f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{Name}-abcde"
@@ -428,7 +475,8 @@ class SecretsSetupTest(unittest.TestCase):
 
     def test_provision_adopts_existing_and_does_not_claim_ownership(self):
         arn = f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{self._NAME}-abcde"
-        client = _FakeSecretsManager(existing={self._NAME: arn})
+        existing = json.dumps({"client_secret": "old"})
+        client = _FakeSecretsManager(existing={self._NAME: arn}, values={self._NAME: existing})
         self._patch(secrets_setup, "DATABRICKS_CLIENT_SECRET", "s3cr3t")
         self._run(secrets_setup.provision, client, self._NAME, "client_secret")
         self.assertIn("put_secret_value", client._kinds())
@@ -456,6 +504,56 @@ class SecretsSetupTest(unittest.TestCase):
             self._run(secrets_setup.provision, client, self._NAME, "client_secret")
         self.assertIn("not JSON", str(ctx.exception))
         self.assertNotIn("put_secret_value", client._kinds())  # nothing written
+
+    def test_provision_refuses_non_object_json_secret(self):
+        # Valid JSON but not an object (a bare string / array / number / null) cannot be merged
+        # into and would otherwise raise a raw TypeError on item assignment. Refuse cleanly.
+        arn = f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{self._NAME}-abcde"
+        for body in ('"just-a-string"', "[1, 2]", "42", "null"):
+            client = _FakeSecretsManager(existing={self._NAME: arn}, values={self._NAME: body})
+            self._patch(secrets_setup, "DATABRICKS_CLIENT_SECRET", "s3cr3t")
+            with self.subTest(body=body), self.assertRaises(SystemExit):
+                self._run(secrets_setup.provision, client, self._NAME, "client_secret")
+            self.assertNotIn("put_secret_value", client._kinds())  # nothing written
+
+    def test_provision_refuses_binary_secret(self):
+        # A binary secret (keystore/cert) has no SecretString; merging a JSON document in would
+        # replace it wholesale. Same data-loss class as non-JSON, reached through another door.
+        arn = f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{self._NAME}-abcde"
+        client = _FakeSecretsManager(existing={self._NAME: arn}, binary={self._NAME: b"\x00keystore"})
+        self._patch(secrets_setup, "DATABRICKS_CLIENT_SECRET", "s3cr3t")
+        with self.assertRaises(SystemExit) as ctx:
+            self._run(secrets_setup.provision, client, self._NAME, "client_secret")
+        self.assertIn("binary", str(ctx.exception).lower())
+        self.assertNotIn("put_secret_value", client._kinds())  # nothing written
+
+    def test_provision_adoption_notice_prints_before_the_write(self):
+        # The "Adopting" notice must precede the put; printing it after the write would tell the
+        # operator we adopted only once the change already landed.
+        arn = f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{self._NAME}-abcde"
+        client = _FakeSecretsManager(
+            existing={self._NAME: arn}, values={self._NAME: json.dumps({"client_secret": "old"})}
+        )
+        self._patch(secrets_setup, "DATABRICKS_CLIENT_SECRET", "s3cr3t")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            secrets_setup.provision(client, self._NAME, "client_secret")
+        text = out.getvalue()
+        self.assertIn("Adopting", text)
+        self.assertLess(text.index("Adopting"), text.index("Updated secret"))
+
+    def test_provision_warns_before_orphaning_a_different_created_secret(self):
+        # The single-slot state file records secret A (created by us). Provisioning a NEW secret B
+        # replaces that record; the operator must be warned that A is no longer --deletable.
+        other_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:other-AbCdEf"
+        self._state.update({"secret_arn": other_arn, "name": "other/secret", "created": True})
+        client = _FakeSecretsManager()  # self._NAME does not exist -> create path
+        self._patch(secrets_setup, "DATABRICKS_CLIENT_SECRET", "s3cr3t")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            secrets_setup.provision(client, self._NAME, "client_secret")
+        self.assertIn("other/secret", out.getvalue())
+        self.assertIn("Warning", out.getvalue())
 
     def test_provision_on_secret_in_recovery_window_tells_user_to_restore(self):
         # describe_secret still resolves a secret scheduled for deletion; provision must not
@@ -533,39 +631,111 @@ class SecretsSetupTest(unittest.TestCase):
         self.assertEqual(self._state.get("name"), self._NAME)  # record survives
         self.assertTrue(self._state.get("created"))
 
+    def test_delete_on_secret_already_in_recovery_window_is_noop(self):
+        # describe_secret still resolves a secret scheduled for deletion; calling delete_secret
+        # again would raise InvalidRequestException AFTER the operator answered the prompt.
+        arn = f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{self._NAME}-abcde"
+        client = _FakeSecretsManager(existing={self._NAME: arn}, deleted={self._NAME})
+        self._state.update({"secret_arn": arn, "name": self._NAME, "created": True})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            secrets_setup.delete(client, self._NAME, force=False, assume_yes=True)
+        self.assertIn("restore-secret", out.getvalue())
+        self.assertNotIn("delete_secret", client._kinds())  # not called again
 
-class CheckSecretJsonKeyTest(unittest.TestCase):
-    """deploy.check_secret_json_key() aborts when the jsonKey deploy would register disagrees
-    with the key secrets_setup.py recorded — the cross-process drift the README export gap
-    invites — but only when secret_state.json actually describes the ARN being deployed."""
 
-    _ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-abcde"
+class ResolveSecretJsonKeyTest(unittest.TestCase):
+    """deploy.resolve_secret_json_key() defaults the jsonKey from secret_state.json so the ARN
+    and its key stay together across the two processes. It adopts the recorded key when the
+    operator did not set one explicitly (removing the cross-process drift class), honors an
+    explicit override with a warning rather than an abort, and touches nothing on the MANAGED
+    path or when the record describes a different secret."""
 
-    def _run(self, arn, deploy_key, state):
+    _ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-AbCdEf"
+
+    def _run(self, arn, deploy_key, state, explicit):
         with mock.patch.object(deploy, "DATABRICKS_SECRET_ARN", arn), \
              mock.patch.object(deploy, "DATABRICKS_SECRET_JSON_KEY", deploy_key), \
-             mock.patch.object(deploy, "recorded_secret_state", lambda: state):
-            deploy.check_secret_json_key()
+             mock.patch.object(deploy, "DATABRICKS_SECRET_JSON_KEY_SET", explicit), \
+             mock.patch.object(deploy, "recorded_secret_state", lambda: state), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return deploy.resolve_secret_json_key()
 
-    def test_no_arn_is_noop(self):
-        self._run("", "anything", {"secret_arn": "x", "json_key": "y"})  # MANAGED path: no check
+    def test_no_arn_returns_key_unchanged(self):
+        # MANAGED path: no record consulted, key returned as-is.
+        self.assertEqual(self._run("", "anything", {"secret_arn": "x", "json_key": "y"}, False), "anything")
 
-    def test_matching_key_passes(self):
-        self._run(self._ARN, "db_oauth_secret", {"secret_arn": self._ARN, "json_key": "db_oauth_secret"})
+    def test_adopts_recorded_key_when_not_explicit(self):
+        key = self._run(self._ARN, "client_secret",
+                        {"secret_arn": self._ARN, "json_key": "db_oauth_secret"}, explicit=False)
+        self.assertEqual(key, "db_oauth_secret")  # the drift the guard used to abort on, now resolved
 
-    def test_mismatch_aborts_naming_both_keys(self):
-        with self.assertRaises(SystemExit) as ctx:
-            self._run(self._ARN, "client_secret", {"secret_arn": self._ARN, "json_key": "db_oauth_secret"})
-        message = str(ctx.exception)
-        self.assertIn("db_oauth_secret", message)  # what secrets_setup wrote
-        self.assertIn("client_secret", message)    # what deploy would register
+    def test_matching_recorded_key_returns_it(self):
+        key = self._run(self._ARN, "db_oauth_secret",
+                        {"secret_arn": self._ARN, "json_key": "db_oauth_secret"}, explicit=False)
+        self.assertEqual(key, "db_oauth_secret")
 
-    def test_state_for_a_different_secret_is_ignored(self):
-        # Record describes another ARN — we can't cross-check, so must not abort on it.
-        self._run(self._ARN, "client_secret", {"secret_arn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:other-xyz", "json_key": "db_oauth_secret"})
+    def test_explicit_override_is_honored_not_aborted(self):
+        # An explicit key that disagrees with the record must be used (merge leaves both keys),
+        # not rejected -- the old guard aborted deploys that would have worked.
+        key = self._run(self._ARN, "client_secret",
+                        {"secret_arn": self._ARN, "json_key": "db_oauth_secret"}, explicit=True)
+        self.assertEqual(key, "client_secret")
 
-    def test_missing_state_is_noop(self):
-        self._run(self._ARN, "client_secret", {})
+    def test_explicit_override_warns_on_stderr(self):
+        with mock.patch.object(deploy, "DATABRICKS_SECRET_ARN", self._ARN), \
+             mock.patch.object(deploy, "DATABRICKS_SECRET_JSON_KEY", "client_secret"), \
+             mock.patch.object(deploy, "DATABRICKS_SECRET_JSON_KEY_SET", True), \
+             mock.patch.object(deploy, "recorded_secret_state",
+                               lambda: {"secret_arn": self._ARN, "json_key": "db_oauth_secret"}):
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                deploy.resolve_secret_json_key()
+            self.assertIn("db_oauth_secret", stderr.getvalue())
+
+    def test_state_for_a_different_secret_returns_deploy_key(self):
+        other = "arn:aws:secretsmanager:us-east-1:123456789012:secret:other-XyZ123"
+        key = self._run(self._ARN, "client_secret",
+                        {"secret_arn": other, "json_key": "db_oauth_secret"}, explicit=False)
+        self.assertEqual(key, "client_secret")
+
+    def test_missing_state_returns_deploy_key(self):
+        self.assertEqual(self._run(self._ARN, "client_secret", {}, explicit=False), "client_secret")
+
+    def test_empty_recorded_key_returns_deploy_key(self):
+        # A falsy recorded key must not override -- fall back to the configured key.
+        key = self._run(self._ARN, "client_secret",
+                        {"secret_arn": self._ARN, "json_key": ""}, explicit=False)
+        self.assertEqual(key, "client_secret")
+
+
+class RecordedSecretStateTest(unittest.TestCase):
+    """deploy.recorded_secret_state() degrades to {} on a missing, unreadable, or non-object
+    state file rather than crashing the caller's .get()."""
+
+    def _read(self, contents):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/secret_state.json"
+            if contents is not None:
+                with open(path, "w") as f:
+                    f.write(contents)
+            with mock.patch.object(deploy, "SECRET_STATE_FILE", path):
+                return deploy.recorded_secret_state()
+
+    def test_missing_file_is_empty(self):
+        self.assertEqual(self._read(None), {})
+
+    def test_non_object_json_is_empty(self):
+        for body in ("[1, 2]", '"a"', "null", "123"):
+            with self.subTest(body=body):
+                self.assertEqual(self._read(body), {})
+
+    def test_malformed_json_is_empty(self):
+        self.assertEqual(self._read("{not json"), {})
+
+    def test_object_is_returned(self):
+        self.assertEqual(self._read('{"json_key": "k"}'), {"json_key": "k"})
 
 
 def _actions_of(statement):

@@ -41,6 +41,10 @@ GENIE_SPACE_ID = os.environ.get("GENIE_SPACE_ID", "")
 # is not needed for deploy.py -- the plaintext never has to live in .env or the shell.
 DATABRICKS_SECRET_ARN = os.environ.get("DATABRICKS_SECRET_ARN", "")
 DATABRICKS_SECRET_JSON_KEY = os.environ.get("DATABRICKS_SECRET_JSON_KEY", "client_secret")
+# Whether the operator set the key explicitly (vs. taking the default). deploy.py adopts the
+# key secrets_setup.py recorded for the secret UNLESS it was set here, so the ARN and its key
+# stay together across the two processes without the operator re-exporting the key.
+DATABRICKS_SECRET_JSON_KEY_SET = "DATABRICKS_SECRET_JSON_KEY" in os.environ
 # Name of the Secrets Manager secret that secrets_setup.py creates/updates. Only used by
 # secrets_setup.py; deploy.py references the secret by ARN via DATABRICKS_SECRET_ARN.
 DATABRICKS_SECRET_NAME = os.environ.get(
@@ -49,7 +53,15 @@ DATABRICKS_SECRET_NAME = os.environ.get(
 # DATABRICKS_SECRET_ARN is fed verbatim into an IAM policy Resource in deploy.py step 4. A bare
 # secret name passes CreateOauth2CredentialProvider but is rejected by put_role_policy AFTER the
 # Cognito pool, IAM role, gateway and provider are already built -- so validate its shape up front.
-_SECRET_ARN_RE = re.compile(r"^arn:aws[a-z0-9-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+")
+# The name charset is botocore's for this API (excludes '*', whitespace and quotes), so a wildcard
+# ARN like ...:secret:* cannot slip through and become an account-wide GetSecretValue grant. The
+# 6-char random suffix AWS appends is REQUIRED: a suffix-less ARN is accepted as a SecretId but the
+# IAM Resource then matches no secret, so the read is denied and tool calls 403 ~an hour after READY.
+# ('-' is placed last in the class so it is a literal, not a range.)
+_SECRET_ARN_RE = re.compile(
+    r"^arn:aws[a-z0-9-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:"
+    r"[a-zA-Z0-9_/+=.@!-]+-[A-Za-z0-9]{6}$"
+)
 
 # Used only by generate_data.py to load the sample dataset. The warehouse is
 # optional: if unset, generate_data.py resolves the one backing GENIE_SPACE_ID.
@@ -128,8 +140,17 @@ def require_databricks_config() -> None:
             f"DATABRICKS_SECRET_ARN is not a Secrets Manager ARN: {DATABRICKS_SECRET_ARN!r}\n"
             "It is used verbatim as an IAM policy Resource; a bare name is accepted by the "
             "credential-provider API but rejected at deploy step 4, after the gateway stack is "
-            "already built. Expected arn:aws:secretsmanager:<region>:<account>:secret:<name>. "
+            "already built. Expected arn:aws:secretsmanager:<region>:<account>:secret:<name>-<suffix> "
+            "(with the 6-character suffix AWS assigns; no '*' or whitespace). "
             "Run `python secrets_setup.py` and copy the ARN it prints."
+        )
+    # jsonKey rides into clientSecretConfig; botocore rejects an empty or >128-char value at
+    # deploy step 3, after the pool/role/gateway exist. An empty value also defeats the default
+    # and writes a secret keyed "". Only meaningful on the EXTERNAL (ARN) path.
+    if DATABRICKS_SECRET_ARN and not (1 <= len(DATABRICKS_SECRET_JSON_KEY) <= 128):
+        raise SystemExit(
+            f"DATABRICKS_SECRET_JSON_KEY must be 1-128 characters, got {len(DATABRICKS_SECRET_JSON_KEY)}. "
+            "It names the key inside the Secrets Manager JSON that holds the OAuth secret."
         )
     # Both set is allowed (the ARN wins in deploy.py), but a stale or typo'd ARN alongside a
     # working plaintext silently takes the EXTERNAL path and only fails at invocation. Warn.

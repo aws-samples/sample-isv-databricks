@@ -158,10 +158,13 @@ ARN — the same least-privilege grant, now pointed at a secret you own and rota
 is a JSON document; `DATABRICKS_SECRET_JSON_KEY` (default `client_secret`) names the key that
 holds the value.
 
-If you set a **non-default** `DATABRICKS_SECRET_JSON_KEY`, export it in the `deploy.py` shell
-too (the block above exports only the ARN). The key must match on both sides or the provider
-reads a field that isn't there; `deploy.py` reads the key `secrets_setup.py` recorded and aborts
-on a mismatch before building anything, rather than letting it surface as a 403 an hour later.
+If you set a **non-default** `DATABRICKS_SECRET_JSON_KEY` at provision time, you do **not** need
+to re-export it for `deploy.py`: `secrets_setup.py` records the key it wrote next to
+`gateway_config.json`, and `deploy.py` adopts that recorded key for this ARN automatically (the
+block above exports only the ARN). Export `DATABRICKS_SECRET_JSON_KEY` again only to deliberately
+override it — `deploy.py` then honors your value and warns if it differs from the recorded one.
+This keeps the ARN and its key together across the two processes rather than letting a mismatch
+surface as a 403 an hour after the target is READY.
 
 Notes:
 
@@ -176,7 +179,9 @@ Notes:
     `SynchronizeGatewayTargets` each read the secret as **the principal running `deploy.py`**.
     Your own credentials therefore need `secretsmanager:GetSecretValue` on this secret.
     Nothing in this sample grants that, and on an administrator principal you will never
-    notice it was required.
+    notice it was required. (`secrets_setup.py` also needs `GetSecretValue` when it adopts an
+    existing secret: it reads the current value to **merge** your key in rather than clobber
+    sibling keys. That read-modify-write is not concurrency-safe — don't run two at once.)
   - **On token refresh** — the Databricks token is cached for its lifetime (~1 hour), so no
     read happens during that window. When it expires, the refresh reads the secret as the
     **gateway execution role**. That is the grant `deploy.py` attaches in step 4, scoped to

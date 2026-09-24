@@ -36,6 +36,11 @@ Usage:
 
 Requires:
     DATABRICKS_CLIENT_SECRET   (the value to store; not needed for --show-arn / --delete)
+    AWS credentials allowing secretsmanager:CreateSecret / PutSecretValue / GetSecretValue /
+      DescribeSecret on the secret (and DeleteSecret / RestoreSecret for --delete). GetSecretValue
+      is needed because adopting an existing secret READS its current value to MERGE our key in.
+      That read-modify-write is not concurrency-safe -- do not run two provisions of the same
+      secret at once.
 Optional:
     DATABRICKS_SECRET_NAME       (default: databricks-genie-agentcore/oauth-client-secret)
     DATABRICKS_SECRET_JSON_KEY   (default: client_secret)
@@ -45,6 +50,7 @@ Optional:
 import argparse
 import json
 import os
+import sys
 
 import boto3
 from config import (
@@ -66,16 +72,23 @@ def build_secret_string(client_secret: str, json_key: str) -> str:
 
 
 def read_secret_state() -> dict:
+    # Catch OSError (not just FileNotFoundError) and a non-object JSON body, so a permission
+    # error or a state file holding a list/scalar degrades to {} rather than crashing on .get.
     try:
         with open(SECRET_STATE_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def write_secret_state(state: dict) -> None:
-    with open(SECRET_STATE_FILE, "w") as f:
+    # Write-then-rename, matching deploy.py's state writes: a truncated state file from a
+    # Ctrl-C mid-write is exactly the case that would strand a secret as un-deletable here.
+    tmp = f"{SECRET_STATE_FILE}.tmp"
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
+    os.replace(tmp, SECRET_STATE_FILE)
 
 
 def clear_secret_state() -> None:
@@ -109,12 +122,19 @@ def find_secret_arn(client, name: str) -> str | None:
 def existing_document(client, name: str) -> dict:
     """The current secret value as a dict, so provision() can MERGE rather than clobber.
 
-    A non-JSON or non-object value is ambiguous to merge into, so refuse rather than
+    A non-JSON, non-object, or binary value is ambiguous to merge into, so refuse rather than
     overwrite a secret we may not own.
     """
     current = client.get_secret_value(SecretId=name).get("SecretString")
-    if not current:
-        return {}
+    if current is None:
+        # No SecretString means the value is binary (SecretBinary) -- a keystore, cert or key.
+        # Merging a JSON document in would overwrite it wholesale and report "preserved 0 fields",
+        # the same data loss the JSON refusals below guard against, reached through another door.
+        raise SystemExit(
+            f"Secret {name} exists but holds a binary value (no SecretString). secrets_setup.py "
+            "stores a JSON document and will not overwrite a binary secret you may rely on "
+            "elsewhere. Point DATABRICKS_SECRET_NAME at a different name."
+        )
     try:
         document = json.loads(current)
     except json.JSONDecodeError:
@@ -139,6 +159,11 @@ def provision(client, name: str, json_key: str) -> str:
             "so this script can store it in Secrets Manager, then re-run."
         )
 
+    # Read the ownership record once, before either branch: the adopt branch needs it to decide
+    # whether we may --delete this secret, and both branches need it to warn before the single-slot
+    # state file overwrites a record for a DIFFERENT secret this script created (see below).
+    prior = read_secret_state()
+
     desc = describe_secret(client, name)
     if desc:
         if desc.get("DeletedDate"):
@@ -154,7 +179,6 @@ def provision(client, name: str, json_key: str) -> str:
         # Adopt in place by MERGING our key into the existing document, so any sibling keys on
         # a secret we did not create survive (the module docstring promises this). Preserve a
         # prior created=True so a create-then-update sequence still lets us --delete it.
-        prior = read_secret_state()
         created = bool(prior.get("created")) and prior.get("secret_arn") == existing_arn
         if not created:
             print(f"  Adopting existing secret {name} (this script did not create it and will not --delete it)")
@@ -174,6 +198,17 @@ def provision(client, name: str, json_key: str) -> str:
         created = True
         print(f"  Created secret {name}")
 
+    # The state file holds one slot. If it already records a DIFFERENT secret this script
+    # created, overwriting it would orphan that secret -- --delete could no longer remove it.
+    # Surface it rather than losing the record silently.
+    if prior.get("created") and prior.get("secret_arn") not in (None, arn):
+        print(
+            f"  Warning: secret_state.json recorded a different secret this script created "
+            f"({prior.get('name')}). That record is being replaced, so `--delete` can no longer "
+            f"remove it. Delete it manually if unneeded:\n"
+            f"    aws secretsmanager delete-secret --secret-id {prior.get('name')}"
+        )
+
     write_secret_state({"secret_arn": arn, "name": name, "created": created, "json_key": json_key})
     return arn
 
@@ -181,14 +216,23 @@ def provision(client, name: str, json_key: str) -> str:
 def delete(client, name: str, force: bool, assume_yes: bool) -> None:
     """Delete the secret ONLY if this script recorded creating it."""
     state = read_secret_state()
-    arn = find_secret_arn(client, name)
-    if not arn:
+    desc = describe_secret(client, name)
+    if not desc:
         print(f"Nothing to delete: secret {name} does not exist.")
         # Only clear the ownership record if it actually refers to THIS name. Running
         # --delete with a different DATABRICKS_SECRET_NAME must not wipe the record for
         # the secret the script really created, leaving it un-deletable by the script.
         if state.get("name") == name:
             clear_secret_state()
+        return
+    arn = desc["ARN"]
+    if desc.get("DeletedDate"):
+        # Already in its recovery window: delete_secret would raise InvalidRequestException
+        # AFTER the operator answered the prompt. Say it's already scheduled and stop.
+        print(
+            f"Secret {name} is already scheduled for deletion (in its recovery window). "
+            f"Nothing to do. To bring it back:\n  aws secretsmanager restore-secret --secret-id {name}"
+        )
         return
     if not (state.get("created") and state.get("secret_arn") == arn):
         raise SystemExit(
@@ -225,10 +269,17 @@ def main() -> None:
     client = boto3.client("secretsmanager", region_name=AWS_REGION)
 
     if args.show_arn:
-        arn = find_secret_arn(client, name)
-        if not arn:
+        desc = describe_secret(client, name)
+        if not desc:
             raise SystemExit(f"Secret {name} does not exist. Run `python secrets_setup.py` to create it.")
-        print(arn)
+        if desc.get("DeletedDate"):
+            # Keep stdout to the bare ARN (scripts capture it); flag the recovery window on stderr.
+            print(
+                f"Note: {name} is scheduled for deletion (in its recovery window); restore it "
+                "before use with `aws secretsmanager restore-secret`.",
+                file=sys.stderr,
+            )
+        print(desc["ARN"])
         return
 
     if args.delete:
