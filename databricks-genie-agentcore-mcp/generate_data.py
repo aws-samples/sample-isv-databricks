@@ -286,15 +286,42 @@ def read_seed_state() -> dict:
         return {}
 
 
+def seed_state_tmp_file() -> str:
+    """The scratch path write_seed_state renames from. Derived at call time, so it follows
+    SEED_STATE_FILE and there is one spelling of the suffix rather than one per caller."""
+    return f"{SEED_STATE_FILE}.tmp"
+
+
 def write_seed_state(state: dict) -> None:
-    with open(SEED_STATE_FILE, "w") as f:
+    # Write-then-rename, the same reason deploy.py's write_state does it: a plain write
+    # truncates first, so a failed or interrupted write leaves invalid JSON,
+    # read_seed_state reads that as {}, and --drop then refuses to reclaim the schema this
+    # script created.
+    #
+    # This covers the write itself, not every way the state can go missing. main() still
+    # calls this once, after the catalog, schema and both tables are created, so a run that
+    # dies during that stretch exits with real objects and no state at all, and --drop
+    # refuses for the same reason. (--drop also only ever drops the schema; the catalog is
+    # left standing either way, which is why created_catalog has no reader today.)
+    tmp = seed_state_tmp_file()
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
+    os.replace(tmp, SEED_STATE_FILE)
 
 
 def clear_seed_state() -> None:
+    # The authoritative file goes first and its failures are not swallowed. drop_seeded
+    # calls this straight after a CASCADE drop, so a seed_state.json that survives still
+    # claims ownership of a schema that no longer exists: recreate that schema by hand and
+    # the next --drop would CASCADE something this script never made. The scratch file is
+    # only litter, so removing it is best effort and cannot mask a failure on the real one.
     try:
         os.remove(SEED_STATE_FILE)
     except FileNotFoundError:
+        pass
+    try:
+        os.remove(seed_state_tmp_file())
+    except OSError:
         pass
 
 

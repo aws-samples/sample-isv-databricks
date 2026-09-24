@@ -11,8 +11,10 @@ gateway_config.json*
 .bedrock_agentcore/
 
 # Written by generate_data.py — records the sample dataset it created so --drop
-# only removes objects this sample made. No secrets, but local state.
-seed_state.json
+# only removes objects this sample made. No secrets, but local state. The glob covers
+# seed_state.json.tmp, which write_seed_state leaves behind when a write fails or a run is
+# interrupted before the rename.
+seed_state.json*
 
 # Written by secrets_setup.py — records the Secrets Manager secret it created (ARN + a
 # created flag) so --delete only removes a secret this script made. No secret value, but

@@ -27,6 +27,7 @@ AWS account, no Databricks workspace, no network:
 
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -82,6 +83,53 @@ class _FakeSql:
     # -- helpers for assertions -------------------------------------------
     def issued(self, fragment):
         return [s for s in self.statements if fragment.upper() in s.upper()]
+
+
+_real_open = open
+
+
+class _FileFailingOnClose:
+    """Opens the real file and fails only at close, which is where a full disk lands for a
+    document this small: json.dump fills an 8 KiB buffer without touching the disk. It
+    delegates to the real open on purpose, so a write that truncates in place still does."""
+
+    def __init__(self, *args, **kwargs):
+        self._f = _real_open(*args, **kwargs)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.close()
+        else:
+            # An exception is already in flight; close for real and let that one win.
+            with contextlib.suppress(Exception):
+                self._f.close()
+        return False
+
+    def __getattr__(self, name):
+        # Forward flush/writelines/name/... so adding a call in write_seed_state surfaces as
+        # a test result rather than an AttributeError from this double.
+        return getattr(self._f, name)
+
+    def close(self):
+        # Close for real first so the fd is not leaked to GC. Note what this does and does
+        # not model: the bytes DO reach the scratch file, so this is "the document landed,
+        # then close reported a failure", not "nothing was written". What the tests assert
+        # either way is that os.replace is never reached. Not in a finally: a real error
+        # from close() should surface rather than be swallowed by the synthetic one.
+        self._f.close()
+        raise OSError("No space left on device")
+
+
+def _json_double():
+    """A module-local stand-in for generate_data's json reference. wraps= keeps load/dumps
+    real, but JSONDecodeError has to be reassigned: wraps leaves it a Mock, and
+    read_seed_state catches it, so a corrupt-file read would raise TypeError instead."""
+    fake = mock.Mock(wraps=json)
+    fake.JSONDecodeError = json.JSONDecodeError
+    return fake
 
 
 def _quiet(fn, *args, **kwargs):
@@ -335,12 +383,25 @@ class SeedStateTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.addCleanup(lambda: os.path.exists(self.path) and os.remove(self.path))
+        # The two write-failure tests below raise between the write and the rename, so the
+        # scratch file really is left behind and really does need removing.
+        self.addCleanup(
+            lambda: os.path.isfile(generate_data.seed_state_tmp_file())
+            and os.remove(generate_data.seed_state_tmp_file())
+        )
 
     def test_round_trip(self):
         generate_data.write_seed_state({"catalog": "c", "created_schema": True})
         self.assertEqual(
             generate_data.read_seed_state(), {"catalog": "c", "created_schema": True}
         )
+        # The rename consumes the scratch file, and the destination is a NEW inode each
+        # time. Both halves matter: a copy leaves the scratch behind, and a copy or an
+        # in-place write keeps the original inode, which is the defect under guard.
+        self.assertFalse(os.path.exists(generate_data.seed_state_tmp_file()))
+        first = os.stat(self.path).st_ino
+        generate_data.write_seed_state({"catalog": "second"})
+        self.assertNotEqual(first, os.stat(self.path).st_ino)
 
     def test_missing_file_reads_as_empty(self):
         self.assertEqual(generate_data.read_seed_state(), {})
@@ -355,6 +416,78 @@ class SeedStateTest(unittest.TestCase):
         generate_data.write_seed_state({"a": 1})
         generate_data.clear_seed_state()
         self.assertFalse(os.path.exists(self.path))
+
+    def _assert_state_file_is(self, expected):
+        """Assert the bytes on disk, not just what read_seed_state tolerates."""
+        try:
+            with open(self.path) as f:
+                raw = f.read()
+        except FileNotFoundError:
+            self.fail("the previous state file is gone entirely")
+        try:
+            actual = json.loads(raw)
+        except json.JSONDecodeError:
+            self.fail(f"the previous state was destroyed; file holds {raw!r}")
+        self.assertEqual(actual, expected)
+
+    def test_a_write_that_fails_midway_leaves_the_previous_state_readable(self):
+        good = {"catalog": "c", "created_schema": True}
+        generate_data.write_seed_state(good)
+        # Patch the module's own reference to json, not json.dump on the shared stdlib
+        # module, so nothing outside generate_data sees a broken serializer.
+        fake_json = _json_double()
+        fake_json.dump.side_effect = OSError("No space left on device")
+        with mock.patch.object(generate_data, "json", fake_json):
+            with self.assertRaises(OSError):
+                generate_data.write_seed_state({"catalog": "later"})
+        self._assert_state_file_is(good)
+
+    def test_the_json_double_keeps_a_real_decode_error(self):
+        """Without this the double is a trap: read_seed_state catches json.JSONDecodeError,
+        so a Mock in that slot turns a corrupt-file read into an unrelated TypeError."""
+        with open(self.path, "w") as f:
+            f.write("{not json")
+        with mock.patch.object(generate_data, "json", _json_double()):
+            self.assertEqual(generate_data.read_seed_state(), {})
+
+    def test_a_write_that_fails_at_close_does_not_replace_good_state(self):
+        good = {"catalog": "c", "created_schema": True}
+        generate_data.write_seed_state(good)
+        with mock.patch.object(generate_data, "open", _FileFailingOnClose, create=True):
+            with self.assertRaises(OSError):
+                generate_data.write_seed_state({"catalog": "later"})
+        self._assert_state_file_is(good)
+
+    def test_a_failed_write_really_does_abandon_a_scratch_file(self):
+        """The premise behind clear_seed_state's second path and the .gitignore glob."""
+        with mock.patch.object(generate_data, "open", _FileFailingOnClose, create=True):
+            with self.assertRaises(OSError):
+                generate_data.write_seed_state({"catalog": "later"})
+        self.assertTrue(os.path.exists(generate_data.seed_state_tmp_file()))
+
+    def test_clear_removes_both_files_in_one_call(self):
+        generate_data.write_seed_state({"catalog": "c"})
+        with mock.patch.object(generate_data, "open", _FileFailingOnClose, create=True):
+            with self.assertRaises(OSError):
+                generate_data.write_seed_state({"catalog": "later"})
+        tmp = generate_data.seed_state_tmp_file()
+        self.assertTrue(os.path.exists(self.path) and os.path.exists(tmp))
+        generate_data.clear_seed_state()
+        self.assertFalse(os.path.exists(self.path), "authoritative state survived")
+        self.assertFalse(os.path.exists(tmp), "scratch file survived")
+
+    def test_clear_reaches_the_authoritative_file_even_if_the_scratch_cannot_go(self):
+        """Ordering guard: drop_seeded clears right after a CASCADE drop, so a surviving
+        seed_state.json would let the next --drop reclaim a schema it never created."""
+        generate_data.write_seed_state({"catalog": "c", "created_schema": True})
+        os.mkdir(generate_data.seed_state_tmp_file())  # os.remove cannot take a directory
+        self.addCleanup(
+            lambda: os.path.isdir(generate_data.seed_state_tmp_file())
+            and os.rmdir(generate_data.seed_state_tmp_file())
+        )
+        generate_data.clear_seed_state()
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(generate_data.read_seed_state(), {})
 
 
 class DropSeededTest(unittest.TestCase):
