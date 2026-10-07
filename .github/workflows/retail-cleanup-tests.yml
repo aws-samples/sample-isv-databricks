@@ -1,0 +1,50 @@
+name: Retail cleanup tests
+
+# Hermetic tests for what the retail sample's cleanup/cleanup.sh is allowed to delete. They run
+# the real cleanup and setup scripts against fake aws and databricks CLIs, so they need bash, jq
+# and the standard library only: no AWS account, no Databricks workspace, no network.
+on:
+  pull_request:
+    paths:
+      - "autonomous-retail-replenishment-genie-quick-mmf/cleanup/**"
+      - "autonomous-retail-replenishment-genie-quick-mmf/scripts/**"
+      - ".github/workflows/retail-cleanup-tests.yml"
+  push:
+    branches: [main]
+    paths:
+      - "autonomous-retail-replenishment-genie-quick-mmf/cleanup/**"
+      - "autonomous-retail-replenishment-genie-quick-mmf/scripts/**"
+      - ".github/workflows/retail-cleanup-tests.yml"
+  workflow_dispatch: {}
+
+# Deny everything at the top level; each job grants only what it needs.
+permissions: {}
+
+jobs:
+  unittest:
+    name: cleanup ownership tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: autonomous-retail-replenishment-genie-quick-mmf
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Assert the suite collected tests
+        # Same guard as tests.yml: fail rather than report a pass over zero tests.
+        run: >-
+          python -c "import sys, unittest;
+          n = unittest.TestLoader().discover('cleanup', pattern='test_*.py').countTestCases();
+          print(f'collected {n} test(s)');
+          sys.exit(0 if n else 'collected 0 tests -- discovery is broken, not the suite passing')"
+
+      - name: Run the tests
+        run: python -m unittest discover -s cleanup -p "test_*.py" -v
