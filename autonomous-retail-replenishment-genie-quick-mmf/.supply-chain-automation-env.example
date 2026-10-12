@@ -21,6 +21,8 @@ export WORKSPACE_USER=""          # databricks auth describe -> the "User" line
 export WORKSPACE_HOST=""          # host without https:// e.g. dbc-xxxxxxxx.cloud.databricks.com
 export WAREHOUSE_ID=""            # optional: reuse an existing serverless SQL warehouse. Leave blank
                                   # and the genie phase creates one and saves the id for later phases.
+                                  # cleanup/cleanup.sh deletes only a warehouse the genie phase created,
+                                  # so a reused one is kept.
 
 # ---- Databricks account (account-admin; OAuth app phase only) --------------
 export DBX_ACCOUNT_PROFILE=""     # account-level CLI profile
@@ -36,10 +38,10 @@ export NOTIFICATION_EMAIL=""      # Quick notification email
 # ---- Genie Agent, console path only (docs/GENIE_SPACE_SETUP_RUNBOOK.md) ----
 # Leave both empty if scripts/setup_databricks.sh creates the Agent: it saves the id to
 # scripts/.env.generated, which loads after this file and takes precedence. On the console path,
-# set GENIE_SPACE_ID. GENIE_SPACE_TITLE is only a fallback: cleanup/cleanup.sh's title lookup
-# reads the first page of results and takes the first match.
-# cleanup/cleanup.sh uses GENIE_SPACE_ID if set, otherwise looks the Agent up by GENIE_SPACE_TITLE,
-# whose default is the scripted title. The connector runbook needs the id for the MCP endpoint.
+# set GENIE_SPACE_ID. cleanup/cleanup.sh trashes only the Agent GENIE_SPACE_ID names. With it unset,
+# cleanup lists every Agent titled GENIE_SPACE_TITLE (default: the scripted title) with the command
+# to trash it, and keeps them all, since a title alone cannot show the Agent is yours.
+# The connector runbook needs the id for the MCP endpoint.
 export GENIE_SPACE_ID=""                    # Configure -> About -> "Agent ID"
 export GENIE_SPACE_TITLE=""                 # e.g. "Fresh Retail Sales Forecasting"
 

@@ -45,9 +45,9 @@ though yours exists; use the Configure panel then. Two ids mean two Agents share
 
 `scripts/setup_databricks.sh` titles the Agent `Supply Chain Demand Forecasting (Chronos-2)` rather
 than the name above, so set `GENIE_SPACE_TITLE` to that to look up a scripted Agent.
-`cleanup/cleanup.sh` discovers by the same variable when `GENIE_SPACE_ID` is unset, so on the console
-path record the id. Setting `GENIE_SPACE_TITLE` instead is a fallback: cleanup's title lookup reads
-only the first page of results and takes the first match.
+`cleanup/cleanup.sh` trashes only the Agent `GENIE_SPACE_ID` names, so on the console path record the
+id. With it unset, cleanup lists every Agent titled `GENIE_SPACE_TITLE` with the command to trash it,
+and keeps them all, since a title alone cannot show the Agent is yours.
 
 The id also appears in the Agent's URL, though not necessarily as the last path segment, so prefer
 the two routes above. The UI says Agent ID, the API

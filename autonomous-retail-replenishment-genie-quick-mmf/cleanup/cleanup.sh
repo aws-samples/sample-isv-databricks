@@ -53,10 +53,52 @@ fi
 # Databricks ids: use env if set, else auto-discover by name/title (symmetric with the Quick lookups above).
 GENIE_SPACE_TITLE="${GENIE_SPACE_TITLE:-Supply Chain Demand Forecasting (Chronos-2)}"
 WAREHOUSE_NAME="${WAREHOUSE_NAME:-Supply Chain Serverless Warehouse}"
-GENIE_SPACE_ID="${GENIE_SPACE_ID:-$(databricks genie list-spaces --profile "$DBX_PROFILE" --output json 2>/dev/null \
-  | jq -r --arg t "$GENIE_SPACE_TITLE" '.spaces[]? | select(.title==$t) | .space_id' | head -1)}"
-WAREHOUSE_ID="${WAREHOUSE_ID:-$(databricks warehouses list --profile "$DBX_PROFILE" --output json 2>/dev/null \
-  | jq -r --arg n "$WAREHOUSE_NAME" '.[]? | select(.name==$n) | .id' | head -1)}"
+
+# genie_ids_by_title TITLE: print every space_id whose title is exactly TITLE, one per line, reading
+# ALL pages of list-spaces (one page holds at most 100). Returns 1 if any page cannot be read, so a
+# partial listing is never reported as a complete one.
+genie_ids_by_title() {
+  local title="$1" token="" page pages=0
+  while (( pages < 100 )); do
+    local args=(genie list-spaces --profile "$DBX_PROFILE" --page-size 100 --output json)
+    [[ -n "$token" ]] && args+=(--page-token "$token")
+    page="$(databricks "${args[@]}" 2>/dev/null)" || return 1
+    jq -r --arg t "$title" '.spaces[]? | select(.title==$t) | .space_id' <<<"$page" || return 1
+    token="$(jq -r '.next_page_token // empty' <<<"$page")"
+    [[ -n "$token" ]] || return 0
+    pages=$((pages + 1))
+  done
+  return 1   # still paging after 100 pages: treat as unreadable rather than loop forever
+}
+
+# The Agent is trashed only by id: GENIE_SPACE_ID, which setup_databricks.sh records for the Agent it
+# creates and the console path sets by hand. An Agent found only by its title is listed with the
+# command to trash it, and kept: in a shared workspace even the only Agent with the scripted title
+# can be someone else's.
+GENIE_SPACE_NOTE=""
+GENIE_FOUND_BY_TITLE=""
+if [[ -z "${GENIE_SPACE_ID:-}" ]]; then
+  # awk drops an id already seen on an earlier page; pipefail (set above) still carries a failed
+  # listing through it.
+  if ! GENIE_FOUND_BY_TITLE="$(genie_ids_by_title "$GENIE_SPACE_TITLE" | awk '!seen[$0]++')"; then
+    GENIE_FOUND_BY_TITLE=""
+    GENIE_SPACE_NOTE="<could not list Genie Agents; set GENIE_SPACE_ID; will skip>"
+  fi
+fi
+GENIE_SPACE_ID="${GENIE_SPACE_ID:-}"
+
+# The warehouse is deleted only if setup_databricks.sh CREATED it, which it records as
+# WAREHOUSE_CREATED_BY_SETUP. WAREHOUSE_ID alone proves nothing: setup saves it for a warehouse the
+# reader asked it to reuse too. Any other warehouse found here, by id or by the scripted name, is
+# listed and kept; a shared workspace can hold several warehouses with that name.
+if [[ -n "${WAREHOUSE_ID:-}" ]]; then
+  WAREHOUSE_FOUND="$WAREHOUSE_ID"
+else
+  WAREHOUSE_FOUND="$(databricks warehouses list --profile "$DBX_PROFILE" --output json 2>/dev/null \
+    | jq -r --arg n "$WAREHOUSE_NAME" '.[]? | select(.name==$n) | .id')"
+fi
+WAREHOUSE_TO_DELETE="${WAREHOUSE_CREATED_BY_SETUP:-}"
+WAREHOUSE_KEPT="$(awk -v d="$WAREHOUSE_TO_DELETE" 'NF && $0 != d' <<<"$WAREHOUSE_FOUND")"
 
 # normalize "None"/empty from the CLI to empty
 for v in FLOW_ID DATASET_ID ANALYSIS_ID DATA_SOURCE_ID GENIE_MCP_CONNECTOR_ID OPENAPI_CONNECTOR_ID; do
@@ -76,8 +118,15 @@ show "Quick MCP connector"   "$GENIE_MCP_CONNECTOR_ID"
 show "Quick OpenAPI connector" "$OPENAPI_CONNECTOR_ID"
 show "S3 Tables bucket"      "${S3T_BUCKET:+$S3T_BUCKET (table+namespace+bucket)}"
 show "Order API stack"       "supplier-order-api (region ${ORDER_API_REGION})"
-show "Genie Agent (Databricks)" "$GENIE_SPACE_ID"
-show "SQL warehouse (Databricks)" "$WAREHOUSE_ID"
+# When nothing will be deleted but something was found, say so instead of show's "not found".
+GENIE_PREVIEW="${GENIE_SPACE_ID:-$GENIE_SPACE_NOTE}"
+[[ -z "$GENIE_PREVIEW" && -n "$GENIE_FOUND_BY_TITLE" ]] && GENIE_PREVIEW="<no recorded id; will keep the Agent listed below>"
+WAREHOUSE_PREVIEW="$WAREHOUSE_TO_DELETE"
+[[ -z "$WAREHOUSE_PREVIEW" && -n "$WAREHOUSE_KEPT" ]] && WAREHOUSE_PREVIEW="<no record that setup created one; will keep the warehouse listed below>"
+show "Genie Agent (Databricks)" "$GENIE_PREVIEW"
+[[ -n "$GENIE_FOUND_BY_TITLE" ]] && show "Genie Agent KEPT" "$(paste -s -d ' ' - <<<"$GENIE_FOUND_BY_TITLE") (found by title only)"
+show "SQL warehouse (Databricks)" "$WAREHOUSE_PREVIEW"
+[[ -n "$WAREHOUSE_KEPT" ]] && show "SQL warehouse KEPT" "$(paste -s -d ' ' - <<<"$WAREHOUSE_KEPT") (cannot confirm setup created it)"
 show "Databricks catalog"    "mmf (--force cascade)"
 echo
 echo ">>> This is PER-RESOURCE teardown. The billable Quick subscription, S3 Tables IAM role, and"
@@ -104,6 +153,15 @@ del() {
 }
 # skip LABEL — resource id was blank (nothing discovered)
 skip() { echo "  – ${1}: not present"; }
+# kept LABEL REASON CMD — for each id on stdin: found but not deleted, and the command to delete it by hand
+kept() {
+  local label="$1" reason="$2" cmd="$3" id
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    echo "  – ${label} ${id}: kept, ${reason}. If it is yours and demo-only:"
+    echo "      ${cmd} ${id} --profile ${DBX_PROFILE}"
+  done
+}
 
 echo; echo "=== Deleting demo resources ==="
 [[ -n "$FLOW_ID" ]]                && del "Quick flow"            q delete-flow            --flow-id "$FLOW_ID"                       || skip "Quick flow"
@@ -126,8 +184,20 @@ fi
 del "Order API stack" aws cloudformation delete-stack --stack-name supplier-order-api --region "$ORDER_API_REGION" --profile "$AWS_PROFILE"
 aws cloudformation wait stack-delete-complete --stack-name supplier-order-api --region "$ORDER_API_REGION" --profile "$AWS_PROFILE" 2>/dev/null || true
 
-[[ -n "$GENIE_SPACE_ID" ]] && del "Genie Agent (Databricks)"   databricks genie trash-space "$GENIE_SPACE_ID" --profile "$DBX_PROFILE" || skip "Genie Agent (Databricks)"
-[[ -n "$WAREHOUSE_ID" ]]   && del "SQL warehouse (Databricks)" databricks warehouses delete "$WAREHOUSE_ID" --profile "$DBX_PROFILE"  || skip "SQL warehouse (Databricks)"
+if [[ -n "$GENIE_SPACE_ID" ]]; then
+  del "Genie Agent (Databricks)" databricks genie trash-space "$GENIE_SPACE_ID" --profile "$DBX_PROFILE"
+elif [[ -n "$GENIE_SPACE_NOTE" ]]; then
+  echo "  – Genie Agent (Databricks): skipped ${GENIE_SPACE_NOTE}"
+elif [[ -z "$GENIE_FOUND_BY_TITLE" ]]; then
+  skip "Genie Agent (Databricks)"
+fi
+kept "Genie Agent" "found by title only" "databricks genie trash-space" <<<"$GENIE_FOUND_BY_TITLE"
+if [[ -n "$WAREHOUSE_TO_DELETE" ]]; then
+  del "SQL warehouse (Databricks)" databricks warehouses delete "$WAREHOUSE_TO_DELETE" --profile "$DBX_PROFILE"
+elif [[ -z "$WAREHOUSE_KEPT" ]]; then
+  skip "SQL warehouse (Databricks)"
+fi
+kept "SQL warehouse" "cleanup cannot confirm setup_databricks.sh created it" "databricks warehouses delete" <<<"$WAREHOUSE_KEPT"
 del "Databricks catalog mmf" databricks catalogs delete mmf --force --profile "$DBX_PROFILE"
 
 echo; echo "=== Per-resource teardown complete. ==="
